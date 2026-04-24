@@ -93,7 +93,7 @@ L3 <-up- L4 : 调用
 ### 0.5 与 v2.0、D01、D02、D03、D04、D05、D06 的关系
 
 - D07 **不向后兼容** v2.0 的某些特殊 token 与必要程序集。发行版若需运行 v2.0 训练的 LoRA，应提供 `--compat=v2` 模式做映射（见附录 F）。
-- D07 相对 D06 **向前兼容**：仅做文本口径与条件从句的澄清（原子操作计数 21→24 统一、`I-EMIT-ESCAPE` 三路径枚举、`resolve_ref` 白名单闭集化、`E_PROTOCOL_VIOLATION` 双站点统一、StreamFrame 三字段语义注释等）；不新增 token、不改动原子操作闭集、action 闭集、必要程序集、能力模型。详见附录 F.10 与本目录 [`01-delta-from-d06.md`](./01-delta-from-d06.md)。D06 合规实现**无需代码改动**即可声称 D07 合规。
+- D07 相对 D06 在协议面上 **无破坏性变更**：仅做文本口径与条件从句的澄清（原子操作计数 21→24 统一、`I-EMIT-ESCAPE` 三路径枚举、`resolve_ref` 白名单闭集化、`E_PROTOCOL_VIOLATION` 双站点统一、StreamFrame 三字段语义注释等）；不新增 token、不改动原子操作闭集、action 闭集、必要程序集、能力模型。详见附录 F.10 与本目录 [`01-delta-from-d06.md`](./01-delta-from-d06.md)。**实现升级路径**（D07-S09~S11 / N13 叠加 RC2 patch-level 补白后引入的实现侧要求）：D06 合规实现 **不需改动核心协议逻辑**，但如未暴露附录 E 的新 `limits` 字段（`session_fork_max_*` / `stream_write_timeout_sec` / `dispatch_timeout_default_ms`）、未声明 `features.dispatch_timeout_enforcement`（§8.1 D07-N13），则 **需补足对应的 runtime info / boot output observability 输出**后方可声称 D07 合规。
 - D06 相对 D05 **向前兼容**：仅修订文本歧义、签名一致性、审计表完备性、错误码命名空间扩展、EBNF 判定边界、L2 KV 截断回退策略、StreamFrame 类型定义等；不新增 token、不改动原子操作闭集、action 闭集、必要程序集。详见附录 F.9 与上一轮 [`../202604240400-d06-revision/01-delta-from-d05.md`](../202604240400-d06-revision/01-delta-from-d05.md)。
 - D05 相对 D04 **向前兼容**：pre-RC1 闭环修订（17 项），详见 D05 附录 F.8。
 - D04 相对 D03 **有意引入一处结构性 breaking change**：`lmsc_ref` 从「start-prefix + 属性 + `/>`」改为配对 token 形式 `<lmsc_ref>kind: "summary";id: "x";</lmsc_ref>`；因此保留 token 总数由 **11 + K** 升为 **12 + K**，并要求 tokenizer、训练语料与实现同步升级。
@@ -520,12 +520,16 @@ session.drop_fork(handle: SessionHandle)-> Result<()>         # 释放 fork
 - **前置**：
   - 实现级别必须为 **L0**（A5 在 L1 / L2 下不可用，调用返 `E_ATOMIC_UNSUPPORTED`）；
   - `fork`：当前 handler **不得**持有进行中的流式 `envelope.emit`（Stream body 尚未耗尽；CoW 语义无法安全切分半写入的 envelope）；持 `session.fork` cap。dispatch 内调用合法——`runtime admin fork`（§12.3）即依赖本路径。（D05-C02：收紧 D04 中"非 dispatch 中"的过度约束；真正的不可分性只在流式 emit 未完结时成立）
+  - **Fork 配额检查**（D07-S07：与附录 G.3 规范常量及 §15.2 已登记错误码正式联动）· kernel **必须**在 CoW KV snapshot 分配 **之前**执行以下三项检查，按下列顺序返回错误：
+    1. **深度**：若自根 session 起向下的 fork 链深度 ≥ `SESSION_FORK_MAX_DEPTH`（附录 G.3；默认 8），返 `E_FORK_DEPTH_EXCEEDED`，audit details `reason="depth_limit"`；
+    2. **并发**：若当前根 session 活跃（未 `drop_fork`）的 fork 总数 ≥ `SESSION_FORK_MAX_CONCURRENT`（附录 G.3；默认 16），亦返 `E_FORK_DEPTH_EXCEEDED`，audit details `reason="concurrent_limit"`——两条结构性上界复用同一错误码，以 audit `reason` 字段区分；新增独立错误码不必要（§15.1 A 类 `E_FORK_` 前缀收敛原则；D07-S11 修正 D07-S07 初稿中误引为 B 类的笔误）；
+    3. **内存配额**：若实现设置了 `SESSION_FORK_MEM_LIMIT_MB`（附录 G.3；默认 1024，`null` 表示不启用），且 **本次 fork 预估 + 当前活跃 fork 累计 CoW 内存** 超过该值，返 `E_FORK_MEM_EXCEEDED`（配额超限）；若深度 / 并发均通过、配额亦充足（或未启用）但底层 CoW 分配失败（物理 OOM / 地址空间耗尽），返 `E_FORK_OOM`（物理分配失败）——两者由附录 F 历史条目 D06-N09 明确区分。
   - `restore` / `drop_fork`：handle 有效。
 - **后置**：
   - `fork` 保存完整 context + KV cache (CoW 引用) + kernel 元数据（程序表、kv refcount、cap 集合、audit cursor）；返回新 SessionHandle，原会话继续存活；
   - `restore` 把当前执行切到目标 session，原 session 仍存活（调用方可用 `drop_fork` 显式释放）；
   - `drop_fork` 释放对应 CoW 引用。
-- **错误**：`E_FORK_INVALID` / `E_FORK_OOM`。
+- **错误**：`E_FORK_INVALID` / `E_FORK_OOM` / `E_FORK_DEPTH_EXCEEDED` / `E_FORK_MEM_EXCEEDED`（触发条件见上述 D07-S07 前置配额检查；retryable 归属见 §15.3）。
 - **备注**：D01 明确采用 **fork 语义**（对 v2.0 A5 的二义性裁决，见审计 C-08）。支持 tree-of-thought、OOM 保护、事务化 dispatch。
 
 ### 5.3 B · Envelope 结构
@@ -928,7 +932,7 @@ lmsc_kv_hook.drop(handle)           -> Result     # A5 drop_fork 物理步
 
 ### 6.5 接入级别（L0 / L1 / L2；Tier 别名）
 
-合规 kernel **必须** 声明级别；`runtime info` 返回：
+合规 kernel **必须** 声明级别；`runtime info` 返回（§9.4 / 附录 E：`kernel.integration_level` / `kernel.integration_tier`，与 boot output schema 一致；正文所称“`runtime info` 返回 `integration_level` / `integration_tier`”皆指此快照下 `kernel` 对象的相应字段）：
 
 | 级别 | Tier 别名 | 支持 | 限制 |
 |---|---|---|---|
@@ -936,7 +940,7 @@ lmsc_kv_hook.drop(handle)           -> Result     # A5 drop_fork 物理步
 | **L1** | **Tier-B** | Sampler + Token Stream；无 KV Hook | A3 `scope=Envelope` 允许按字节精度降级实现（详见 §5.2 A3 降级 / T-S02），**不得**强制退化到 turn 起点；**A5 不可用**（`session.fork/restore/drop_fork` 返 `E_ATOMIC_UNSUPPORTED`）；H3 可选 |
 | **L2** | **Tier-C** | 仅 Token Stream（后处理识别） | A1 退化为 stop-sequence；A3 `scope ∈ {Turn, Envelope}` 由事后扫描判定；**A5 不可用**；A2、H3 可不提供 |
 
-> **Tier 别名说明**（D02 新增，对追加项 E-04 的修补）· L0/L1/L2 的数字命名与“数字越大能力越强”的业界惯例反；D02 同时引入 **Tier-A / B / C** 别名（A 最强，与字母序一致）。两种命名方式在 D02 并列；`runtime info` 同时暴露 `integration_level` 与 `integration_tier`；合规判定以 L0/L1/L2 为准。
+> **Tier 别名说明**（D02 新增，对追加项 E-04 的修补）· L0/L1/L2 的数字命名与“数字越大能力越强”的业界惯例反；D02 同时引入 **Tier-A / B / C** 别名（A 最强，与字母序一致）。两种命名方式在 D02 并列；`runtime info` 同时暴露 `kernel.integration_level` 与 `kernel.integration_tier`（与附录 E schema 一致；旧文本的“顶层 `integration_level`”为同一快照的简述形式，正规路径以 schema 为准）；合规判定以 L0/L1/L2 为准。
 
 L2 / Tier-C 是合规最低门槛；L0 / Tier-A 是生产推荐。D02 F-01 取消了 Word / Stmt scope，因此 rollback 在任一级别下的语义均为"**pattern 模式串最近匹配截断**"，无级别相关的启发式。
 
@@ -965,7 +969,7 @@ D04 明确：
   2. emit audit `kind=protocol_violation`，details 包含 `invariant` 名、`token_position`、`violation_detail`；
   3. 返回给调用方 `E_PROTOCOL_VIOLATION`（若该 abort 由程序侧 syscall 路径触发或程序显式观测该事件；D07-S04 统一与 §5.2 A3 L2 回退路径作简；模型路径仅 emit audit，不向任何调用方返错）。
 - L2 实现**不得**静默忽略协议违规。
-- `runtime info` 的 `integration_level="L2"` 必须附带 `features.invariant_enforcement="post-hoc"`。
+- `runtime info` 的 `kernel.integration_level="L2"` 必须附带 `features.invariant_enforcement="post-hoc"`。
 
 L0 / L1 不受本节影响：不变量仍由 A1 强制。
 
@@ -1102,9 +1106,17 @@ handler:
 
 constraints:                   # 可选
   rollback_safe: bool          # 默认 true
-  max_dispatch_ms: u32
+  max_dispatch_ms: u32         # 单次 dispatch 墙钟上限（毫秒）；语义见下方 D07-N13
   reentrant: bool              # 默认 false
 ```
+
+**`constraints.max_dispatch_ms` 语义**（D07-N13：D06 遗留孤儿字段闭环）· 声明单次 `dispatch(ctx, args)` 调用的墙钟执行上限（毫秒）。kernel 的强制语义由 `runtime info.features.dispatch_timeout_enforcement ∈ {"enforced", "advisory", "off"}` 显式声明：
+
+- `enforced`（L0 推荐）· kernel **必须**在 dispatch 运行超过该值时走与 C3 abort 等价的路径：若 handler 注册了 `on_abort`，先调 `on_abort(ctx, envelope_id)` 清理，再对任何未关闭的流式 `envelope.emit` 注入 close 序列，随后 emit audit `kind=abort`，details 含 `reason="dispatch_timeout"` 与 `elapsed_ms`（实测墙钟）；dispatch 最终返回 `E_HANDLER_PANIC`（复用既有 B 类错误码，§15.1；retryable 归属沿用 `E_HANDLER_PANIC` 语义，即"实现定义"）；`on_abort` 自身再度 panic 时按 §5.3 B2 规则吞掉并在 details 置 `nested_panic=true`。字段未声明时使用附录 E `limits.dispatch_timeout_default_ms`（若为 null 则不启用 timeout）。
+- `advisory` · kernel 仅在 dispatch 超时时 emit audit `kind=x-lmsc-dispatch-advisory`（D07-S09：采用 §14.2.1 规定的 `x-<vendor>-<name>` 扩展命名，避免使用未登记的裸 identifier `hint`；`x-lmsc-` 前缀保留给本规范非 RC gate 的观测类扩展），details 含 `reason="dispatch_timeout_advisory"`、`elapsed_ms`、`budget_ms`；默认 `scope=system-only`，仅暂留观测性用途，**不**中断 dispatch、**不**返回错误；用于生产环境的性能观测与容量规划。
+- `off` · kernel 忽略该字段；manifest 仍可声明（作为协作者文档），但既不审计也不强制。
+
+不支持强制语义的实现**必须**声明为 `advisory` 或 `off`，不得声称 `enforced` 但实际不执行超时中断。
 
 ### 8.2 Handler 生命周期
 
@@ -1485,7 +1497,7 @@ capability := category "." verb [ "." qualifier ] [ ":" scope ]
 **Namespace 与子命令**：
 
 ```
-runtime info                            # 返回附录 E 的完整 boot output snapshot
+runtime info                            # 返回当前状态快照（与 boot output 同一 schema；值可因快照时点不同而差异，如 `capabilities.granted` / `programs.recommended` / `features.*` 及 `limits` 实际生效值；见 §9.4 / 附录 E）
 runtime stats                           # token 使用量、kv 条目、blob 大小、region 数；D02 新增 protocol_overhead
 
 # query 子 namespace（默认所有程序可读）
@@ -1718,7 +1730,7 @@ AuditRecord := {
 
 | kind | 触发 | details |
 |---|---|---|
-| `boot` | 会话开始 | protocol.version, features |
+| `boot` | 会话开始 | protocol.revision, features |
 | `dispatch` | B2 | program, argv, status |
 | `cap_grant` | D2 | cap, source, ttl |
 | `cap_revoke` | D3 | cap_id, reason |
@@ -1772,7 +1784,7 @@ append-only；不进 context；sink 由 kernel 配置（内存 / 磁盘 / 远程
 | 前缀 | 类别 |
 |---|---|
 | `E_TOKEN_` / `E_MASK_` / `E_ROLLBACK_` / `E_INJECT_` / `E_FORK_` | A |
-| `E_ENVELOPE_` / `E_DISPATCH_` / `E_EMIT_` | B |
+| `E_ENVELOPE_` / `E_ENV_` / `E_DISPATCH_` / `E_UNKNOWN_` / `E_HANDLER_` / `E_EMIT_` | B （D07-N12：历史疑似前缀 `E_ENV_`、`E_UNKNOWN_`、`E_HANDLER_` 已分别用于 `E_ENV_KIND_FORBIDDEN`、`E_UNKNOWN_PROGRAM`、`E_HANDLER_PANIC`，构成 B 类的合法变体前缀；新增 B 类错误码**应**优先使用 `E_ENVELOPE_` / `E_DISPATCH_` / `E_EMIT_`）|
 | `E_SUSPEND_` / `E_ABORT_` / `E_PREEMPT_` / `E_FRAME_` | C |
 | `E_CAP_` | D |
 | `E_PROG_` | E |
@@ -1910,6 +1922,7 @@ E_FORK_MEM_EXCEEDED                   # D03 G-S22
 - **不** retryable：`E_ENV_KIND_FORBIDDEN`、`E_FORK_DEPTH_EXCEEDED` / `E_FORK_MEM_EXCEEDED`（需先缩减深度/释放 fork 后重新请求）；
 - **不** retryable：`E_REF_KIND_TAKEN` / `E_REF_NOT_FOUND` / `E_REF_EXPIRED` / `E_REF_BODY_INVALID`——ref 解析类错误，均为编排或格式问题（kind 未注册、ref 已过期、body 微文法违规），重试无意义。
 - **不** retryable：`E_BOOT_REFRESH_LIMIT`（D05-S01）——单 turn 内已达配额，需等下一 turn 才可再次触发。
+- **实现定义**（impl-defined，D07-S10：闭合 §8.1 `max_dispatch_ms enforced` 对 `E_HANDLER_PANIC` retryable 归属的引用）：`E_HANDLER_PANIC`。默认应作为不 retryable 对待（独立 panic 通常意味着确定性 bug）；实现**可**在错误码注册表中将其标为 retryable，并在 `runtime info.features` 中观察——`max_dispatch_ms enforced` 路径下（纯超时中断而非程序 bug）与正常 panic 路径的 retryable 归属需由实现在错误码注册表中明确声明，必要时可细分为两个条目（如 `E_HANDLER_PANIC` + `E_HANDLER_PANIC:dispatch_timeout` 变体，由 audit `details.reason` 区分，否则二者共用同一 retryable 结论）。
 
 ---
 
@@ -1929,7 +1942,7 @@ E_FORK_MEM_EXCEEDED                   # D03 G-S22
 
   本级别对应的 `atomics` 列表**必须**在附录 E boot output 中准确反映。调用被豁免的原语**必须返** `E_ATOMIC_UNSUPPORTED`。
 - **C-2** · 按 §4 实现协议面；tokenizer 保留 token 集合与 §4.1 一致，总数 = **12 + K**（D04 修订：envelope 4 对、control 2 个、ref 2 个、key K 个）。
-- **C-3** · 按 §6 接入推理栈，声明 L 级（L0 / L1 / L2，L2 最低）。`runtime info` **必须**同时返回 `integration_tier`（A/B/C）作为别名。
+- **C-3** · 按 §6 接入推理栈，声明 L 级（L0 / L1 / L2，L2 最低）。`runtime info` **必须**同时返回 `kernel.integration_tier`（A/B/C）作为别名。
 - **C-4** · 按 §7 暴露 syscall，支持至少一种受限 backend（WASM 或 Lua）。
 - **C-5** · 按 §8 加载 manifest 格式的程序；action 闭集恰好 **7 条**。
 - **C-6** · 按 §12 附带**恰好 4 个** 必要程序。
@@ -2133,10 +2146,12 @@ kernel:
 
 features:                # D05-C04：由字符串列表改为显式 map schema，与正文 `features.X=value` 的使用方式闭环
   invariant_enforcement:          "enforced" | "post-hoc"   # §6.5.1；L0/L1=enforced，L2=post-hoc
-  rollback_truncate_precision:    "byte" | "token"          # §5.2 A3 降级；L0/L1 必为 byte，L2 若适配层不支持字节精度可声明 token
+  rollback_truncate_precision:    "byte" | "token" | "none"   # §5.2 A3 降级；L0/L1 必为 byte；L2 若适配层不支持字节精度可声明 token；
+                                                             # 若既不支持 byte 也不支持 token 截断（D06-C01 / §16.1 C-15 回退路径）声明 "none"：D07 补入 schema 取值域。
   envelope_emit_stream:           "native" | "buffered"     # §6.5.2；L0/L1 必为 native，L2 可声明 buffered
   edit_stream_chunked:            bool                      # 历史 flag；false 表示 buffered 模式下无法提供 CHUNK_MAX_TOKENS 粒度回调
   ref_kind_output:                bool                      # kernel 是否内置 kind=output 的 ref resolver（默认 true）
+  dispatch_timeout_enforcement:   "enforced" | "advisory" | "off"   # §8.1 D07-N13；声明 manifest `constraints.max_dispatch_ms` 的强制语义；不支持强制超时的实现必须声明 advisory 或 off
   # 发行版自定义 feature 字段应以 `x-<vendor>-<name>` 前缀命名（与 §11.1 / §14.2.1 一致）
 
 tokens:
@@ -2166,6 +2181,12 @@ limits:
   inject_max_tokens:          int
   emit_body_max_bytes:        int
   chunk_max_tokens:           int
+  # D07-S08：补齐附录 G 规范常量 → limits schema 的映射，消除「G 定义但 E 未暴露」的实现歧义
+  stream_write_timeout_sec:   int        # 对应 `STREAM_WRITE_TIMEOUT`（附录 G.4），单位秒；超时 `E_EMIT_STREAM_BACKPRESSURE_TIMEOUT`
+  session_fork_max_depth:     int        # 对应 `SESSION_FORK_MAX_DEPTH`（附录 G.3）；超限 `E_FORK_DEPTH_EXCEEDED`
+  session_fork_max_concurrent: int       # 对应 `SESSION_FORK_MAX_CONCURRENT`（附录 G.3）；超限亦返 `E_FORK_DEPTH_EXCEEDED`，audit details 置 `reason="concurrent_limit"` 与深度超限区分
+  session_fork_mem_limit_mb:  int?       # 对应 `SESSION_FORK_MEM_LIMIT_MB`（附录 G.3）；null 表示实现不施加配额（仅受物理 OOM 约束）；非 null 时超限 `E_FORK_MEM_EXCEEDED`
+  dispatch_timeout_default_ms: int?      # 实现可选：当 manifest 未声明 `constraints.max_dispatch_ms` 时使用的缺省值（§8.1 D07-N13）；null 表示默认不启用 dispatch timeout
 
 persona: string?
 ```
@@ -2380,7 +2401,7 @@ D06 **不引入新 token**、**不改动原子操作闭集**（24 核心 + 2 可
 
 #### F.10 D07 相对 D06 的变化（RC2 口径对齐；6 方评审聚合：claude / chatglm / deepseek / gemini / kimi / gpt）
 
-基于 [`../202604240400-d06-revision/02-revision-checklist.md`](../202604240400-d06-revision/02-revision-checklist.md) 的仲裁结果，本轮共应用 18 项修补（2 C + 5 S + 10 N + 1 合并）；详见本目录 [`01-delta-from-d06.md`](./01-delta-from-d06.md)。
+基于 [`../202604240400-d06-revision/02-revision-checklist.md`](../202604240400-d06-revision/02-revision-checklist.md) 的仲裁结果，本轮共应用 18 项修补（2 C + 5 S + 10 N + 1 合并）；后续经 GPT 评审员五轮复核叠加 6 项 RC2 patch-level 补白（D07-S07 / S08 / S09 / S10 / S11 / N13，均属规范历史条目与正文 / schema 间的文本裂缝，不改变架构决策）；详见本目录 [`01-delta-from-d06.md`](./01-delta-from-d06.md)。
 
 | ID | 章节 | 要点 |
 |---|---|---|
@@ -2402,13 +2423,19 @@ D06 **不引入新 token**、**不改动原子操作闭集**（24 核心 + 2 可
 | D07-N09 | §1 术语表 | 补 StreamFrame / backpressure / buffered / native 四个条目的定义 |
 | D07-N10 | §15.2 `E_FORK_OOM` | 补 Retryable 实现定义说明：物理内存回升后重试可能成功；可侧建议先 `drop_fork` 释放旧分支再重试 |
 | D07-N11 | §15.2 `E_ROLLBACK_BOUNDARY` 注 | "历史路径应替换" 收紧为 MUST NOT："合规实现不得在任何代码路径中产生 `E_ROLLBACK_BOUNDARY`" |
+| D07-S07 | §5.2 A5 `session.fork` 前置 / 错误行 | 正文显式写入深度 / 并发 / 内存配额三条检查及对应错误码，与附录 G.3 常量与 §15.2 已登记错误码 `E_FORK_DEPTH_EXCEEDED` / `E_FORK_MEM_EXCEEDED` 正式联动；并发上界复用 `_DEPTH_EXCEEDED` 以 audit `reason` 字段区分（GPT 四轮复核 #2）|
+| D07-S08 | 附录 E Boot Output `limits` schema | 补入 `stream_write_timeout_sec` / `session_fork_max_depth` / `session_fork_max_concurrent` / `session_fork_mem_limit_mb` / `dispatch_timeout_default_ms` 五字段，消除附录 G 定义但 E 未暴露的实现歧义（GPT 四轮复核 #1）|
+| D07-N13 | §8.1 manifest `constraints.max_dispatch_ms` / 附录 E `features` map | 为孤儿字段补完整语义：kernel timeout 行为、audit `reason="dispatch_timeout"`、复用 `E_HANDLER_PANIC`；新增 `features.dispatch_timeout_enforcement ∈ {enforced, advisory, off}` 明确声明强制语义（GPT 四轮复核 #3）|
+| D07-S09 | §8.1 `max_dispatch_ms advisory` 路径 | 将 D07-N13 初稿中引入的未登记裸 audit kind `hint` 改为 §14.2.1 合规的扩展命名 `x-lmsc-dispatch-advisory`（默认 `scope=system-only`），消除与 audit kind 表及扩展命名规则的冲突（GPT 五轮复核 #1）|
+| D07-S10 | §15.3 retryable 列表 | 新增「实现定义」分组并显式登记 `E_HANDLER_PANIC`；默认作为不 retryable 对待，实现可在注册表标为 retryable 并细分变体（如 `dispatch_timeout` reason）以区别 `max_dispatch_ms enforced` 路径与程序 bug 路径；闭合 §8.1 对该错误码 retryable 归属的引用（GPT 五轮复核 #2）|
+| D07-S11 | §5.2 A5 并发上限理由 | 笔误订正：「§15.1 B 类前缀收敛原则」→ 「A 类 `E_FORK_` 前缀收敛原则」（§15.1 明确将 `E_FORK_` 归为 A 类）（GPT 五轮复核 #3）|
 
 **合并 / 驳回的 review 意见**（详见 checklist §7.4）：
 
 - **S-06**（合并到 S-01）· 两者同址修改，一次拆写即完整覆盖；
 - **N-05 / N-12 / N-13 / N-15 / N-18**（DEFER 或已被其他项覆盖）· N-05 同 N-03；N-18 "最小合规清单" 升级为新章节工作量过大，留待 RC3；其余在既有条款内已隐含。
 
-D07 **不引入新 token**、**不改动原子操作闭集**（24 核心 + 2 可选）、**不变更 action 闭集**（7 条）、**不变更必要程序集**（4 个）、**净增错误码 0 项**。纯文本 / 口径层修订，D06 合规实现无需代码改动；仅需核对实现行为与本轮澄清的 6 处条件从句一致即可声称 D07 合规。
+D07 **不引入新 token**、**不改动原子操作闭集**（24 核心 + 2 可选）、**不变更 action 闭集**（7 条）、**不变更必要程序集**（4 个）、**净增错误码 0 项**。协议面上无破坏性变更；但经 GPT 五轮复核补白（D07-N13 / S09 / S10）后新增了**实现侧 observability 要求**：附录 E `limits` 新字段与 `features.dispatch_timeout_enforcement` 声明均为规范要求（§8.1 / §14.2.1 对应条款中使用 MUST）。D06 合规实现的协议逻辑**无需改动**即可通过语义层合规性校验；但若未暴露该等字段 / 未声明 enforcement 策略，需补足 metadata / observability 输出后方可声称 D07 完全合规。
 
 ### 附录 G · 限制常量默认值
 
@@ -2511,7 +2538,7 @@ D07 相对 D06 的核心改进一批：
 - **Significant 5 项**：`frame.supports` 与 `frame.push`/`pop` cap 要求拆写（S01）；`resolve_ref` 白名单改为闭集枚举（S02）；persona-refresh "不得在 envelope 内" 精确化为"持有未关闭的流式 envelope.emit 时"（S03）；`E_PROTOCOL_VIOLATION` 在 §5.2 A3 与 §6.5.1 两处条件从句统一（S04）；`StreamFrame` 三字段语义注释完整化（S05）。
 - **Nit 10 项**：`広告`→`公告` typo / "述视觉"衍字 / emit Stream 超限即刻 abort / Scope=Turn 上界正向表述 / `emit_output` action 覆盖 output+edit 两 kind 备注 / rollback envelope 临时占栈说明 / atomics 筛选准则 / 术语表补 StreamFrame/backpressure/buffered/native / `E_FORK_OOM` Retryable 实现定义 / `E_ROLLBACK_BOUNDARY` "不得产生" 收紧为 MUST NOT。
 
-D07 **不改变**任何已定常量、接入级别语义、保留 token 总数（12 + K）、action 闭集（7 条）、必要程序数（4 个）、原子操作数（24 核心 + 2 可选）；**净增错误码 0 项**。纯文本 / 口径层修订，D06 合规实现无需代码改动；仅需核对实现行为与本轮澄清的条件从句一致即可声称 D07 合规。
+D07 **不改变**任何已定常量、接入级别语义、保留 token 总数（12 + K）、action 闭集（7 条）、必要程序数（4 个）、原子操作数（24 核心 + 2 可选）；**净增错误码 0 项**。协议面上无破坏性变更；RC2 patch-level 补白（D07-N13 / S08~S10）叠加了新的 **实现侧 metadata / observability 要求**（附录 E `limits` 新字段、`features.dispatch_timeout_enforcement` 声明、错误码注册表 retryable 分组）。D06 合规实现的协议逻辑 **无需改动**；但若实现此前未暴露上述 `limits` / `features` 字段，需补全 runtime info / boot output 输出后方可声称 D07 完全合规。
 
 **累积背景**：
 
