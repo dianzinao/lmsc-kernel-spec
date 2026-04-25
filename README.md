@@ -36,7 +36,7 @@ This separation is what turned raw hardware into reliable computers. LMSC applie
 
 - **Context is memory** — and must be managed with the same rigor as RAM.
 - **Envelopes, not natural language** — special tokens define a machine-readable instruction set for dispatching, output, editing, and rollback.
-- **Real rollback, not “sorry”** — a `\<lmsc\_rollback\>` token physically truncates the KV cache to a precise point in history, undoing mistakes deterministically.
+- **Real rollback, not “sorry”** — a `<lmsc_rollback>` token physically truncates the KV cache to a precise point in history, undoing mistakes deterministically.
 - **Capabilities, not prayers** — access control is enforced at the syscall boundary, not by asking the model to “please be safe.”
 - **Programs, not plugins** — any language that can speak the syscall interface can run as a first-class program on LMSC.
 
@@ -55,7 +55,7 @@ This is **V1 draft**. It has been designed in solitude and has not yet been impl
 
 **That’s exactly why it’s here.**
 
-It needs to be read by people who understand LLMs, operating systems, or preferably both. It needs to be attacked, questioned, and refined.
+It needs to be read by people who understand LLMs, operating systems, or, preferably, both. It needs to be attacked, questioned, and refined.
 
 ---
 
