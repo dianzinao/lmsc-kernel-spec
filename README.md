@@ -88,9 +88,6 @@ A: For the full L0 spec with special tokens, yes. But a “Lite” version that 
 **Q: Is this a real operating system?**
 A: It’s a kernel specification for a language model runtime. It provides the same *architectural guarantees* as an OS kernel: isolation, resource management, and a stable syscall interface.
 
-**Q: Who are you?**
-A: A programmer who spent a week thinking about what a computer designed for LLMs would look like. This spec is the result.
-
 ---
 
 ## License
@@ -103,7 +100,7 @@ You are free to share, adapt, and implement it — as long as you give proper cr
 <a name="chinese-summary"></a>
 ## 中文摘要
 
-LMSC（大模型专用计算机）是一份为大型语言模型设计的内核规范。它不关心如何“调教”模型，而是为模型提供一套确定性的、可编程的控制接口 —— 就像操作系统为普通计算机提供的那样。
+LMSC（大模型专用计算机）是一份为大型语言模型设计的[内核规范](LMSC-KERNEL-SPEC-DRAFT-01-ZH.md)。它不关心如何“调教”模型，而是为模型提供一套确定性的、可编程的控制接口 —— 就像操作系统为普通计算机提供的那样。
 
 核心理念：将大模型视作一台计算机，其上下文为内存，token 流为 I/O 总线，而 LMSC 是它的操作系统内核。通过特殊 token 协议（Envelope、Rollback）、能力系统（Capability）和原子操作（Syscall），LMSC 将安全、纠错和资源管理从“自然语言劝说”下沉到“机制强制执行”的层面。
 
