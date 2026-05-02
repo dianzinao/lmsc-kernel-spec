@@ -60,6 +60,8 @@ L3 <-up- L4 : invokes
 - LoRA training-data formats;
 - Frontend UI, Agent policy, or business logic.
 
+> **Implementation and deployment note (non-normative)** - This specification defines the observable semantics and error boundaries of rollback, but it does not require a base model to naturally choose optimal `<lmsc_rollback>PATTERN</lmsc_rollback>` truncation points without training. Production distributions typically need instruction tuning, preference data, or adapter-layer constraints so the model learns to choose patterns that actually exist, avoid crossing `I-ROLLBACK-BOUND`, and follow the §15 error expression when a boundary is hit. That training strategy is outside the conformance surface, but should be part of deployment evaluation.
+
 ---
 
 > LMSC Kernel Specification draft v1
@@ -510,7 +512,7 @@ Scope := Envelope | Turn
   - On miss (`pattern_not_found`) or if any byte of the hit interval is out of bounds (`pattern_out_of_bound`): leave KV unchanged;
   - Emit audit `kind=rollback`, with details containing `outcome ∈ {truncated, pattern_not_found, pattern_out_of_bound}` / `search_scope` / `pattern_bytes_len` / `truncated_tokens` (when `outcome=truncated`). Here `pattern_out_of_bound` distinguishes "pattern does not exist in the whole context" from "some byte in the matched interval falls outside the boundary". `search_scope` records the A3 argument or model-path inference, avoiding reuse of top-level `AuditRecord.scope` visibility semantics.
   - `ROLLBACK_STORM_LIMIT` counting follows the §13.3 rule: within a single turn, both **successful** (`outcome=truncated`) and **failed** (`pattern_not_found` / `pattern_out_of_bound`) attempts count toward the same counter, without distinction.
-- **Errors**: `E_ROLLBACK_STORM` / `E_ROLLBACK_PATTERN_EMPTY`/ `E_ROLLBACK_PATTERN_NOT_FOUND`/ `E_ROLLBACK_PATTERN_TOO_LONG`/ `E_ROLLBACK_PATTERN_INVALID`.
+- **Errors**: `E_ROLLBACK_STORM` / `E_ROLLBACK_PATTERN_EMPTY` / `E_ROLLBACK_PATTERN_NOT_FOUND` / `E_ROLLBACK_BOUNDARY_HIT` / `E_ROLLBACK_PATTERN_TOO_LONG` / `E_ROLLBACK_PATTERN_INVALID`. On the program path (if legally enabled by a future major version or distribution extension), `pattern_not_found` returns `E_ROLLBACK_PATTERN_NOT_FOUND`, while `pattern_out_of_bound` returns `E_ROLLBACK_BOUNDARY_HIT`; both details maps **MUST** retain the `outcome` value from the same `rollback` audit.
 
 A model-triggered `<lmsc_rollback>…</lmsc_rollback>` envelope and a program call to this primitive are **semantically equivalent**; both paths share the preconditions and invariants above. A miss on the model path does not report an error and only emits audit. **Model path `scope` inference**: current state `IN_ENVELOPE` -> `Envelope`; current state `GENERATING` -> `Turn`. The program-path syscall signature does not provide a default; the caller **MUST** pass `scope` explicitly. When a language binding or the kernel receives a defaulted/missing scope, it **MUST** reject the call and return `E_PROTOCOL_VIOLATION` or an equivalent binding-layer error.
 
@@ -581,7 +583,7 @@ session.drop_fork(handle: SessionHandle)-> Result<()> # release a fork
 
 - **Preconditions**:
   - The implementation level **MUST** be **L0** (A5 is unavailable under L1 / L2; calls return `E_ATOMIC_UNSUPPORTED`);
-  - `current_handle`: the caller holds the `session.fork` cap; returns the `SessionHandle` for the current session, does not create a new fork, does not allocate a CoW snapshot, and does not count against fork depth / concurrency / memory quotas;
+  - `current_handle`: the caller holds the `session.read` cap (granted to every registered program by default; see §7.2 / Appendix B); returns the `SessionHandle` for the current session, does not create a new fork, does not allocate a CoW snapshot, and does not count against fork depth / concurrency / memory quotas;
   - `fork`: **handlers in the session **MUST NOT** hold an in-progress streaming `envelope.emit`**; if this condition is violated, the kernel **MUST** return `E_EMIT_STREAM_OPEN`, with details containing at least `open_stream_count`, and **SHOULD** contain the list of unclosed `envelope_id` values that can be exposed; calling inside dispatch is legal: `runtime admin fork` (§12.3) depends on this path. (Cannot fork while streaming emit is unfinished.)
   - **Fork quota checks** (formally linked to Appendix F.3 normative constants and the errors registered in §15.2) - before allocating a CoW KV snapshot, the kernel **MUST** perform the following three checks, returning errors in this order. In concurrent scenarios, crossing through the gap between assignment and allocation **MUST** be guarded (quota check + CoW allocation **MUST** hold a mutex or equivalent semantics for the same root session):
     1. **Depth**: if the fork-chain depth from the root session downward is ≥ `SESSION_FORK_MAX_DEPTH` (Appendix F.3; default 8), return `E_FORK_DEPTH_EXCEEDED`, audit details `reason="depth_limit"`;
@@ -595,7 +597,7 @@ session.drop_fork(handle: SessionHandle)-> Result<()> # release a fork
   - `drop_fork` releases the corresponding CoW reference.
 - **Errors**: `E_FORK_INVALID` / `E_EMIT_STREAM_OPEN` / `E_FORK_OOM` / `E_FORK_DEPTH_EXCEEDED` / `E_FORK_MEM_EXCEEDED` (trigger conditions are described in the precondition quota checks above; retryable classification is in §15.3).
 - **Notes**: explicitly uses **fork semantics**. Supports tree-of-thought, OOM protection, and transactional dispatch.
-- **`SessionHandle` type** - `SessionHandle` is an in-memory handle (opaque type); it is **not** serializable and **MUST NOT** be persisted across sessions; it is valid only during the current kernel instance lifecycle. `current_handle()` and `fork()` return the same kind of handle; a program can save the parent session handle before `restore(child)` and later use `restore(parent)` to return to the parent branch. Carrying the handle across processes / deployments **MUST** return `E_FORK_INVALID`.
+- **`SessionHandle` type** - `SessionHandle` is an in-memory handle (opaque type); it is **not** serializable and **MUST NOT** be persisted across sessions; it is valid only during the current kernel instance lifecycle. `current_handle()` and `fork()` return the same kind of handle, but reading the current handle and creating / switching forks are separated by capability: `current_handle()` requires only `session.read`, while `fork()` / `restore()` / `drop_fork()` still require `session.fork`. A program can save the parent session handle before `restore(child)` and later use `restore(parent)` to return to the parent branch. Carrying the handle across processes / deployments **MUST** return `E_FORK_INVALID`.
 
 ## 5.3 B - Envelope Structure
 
@@ -1206,7 +1208,8 @@ ctx.clock # I1
 | `tokens.is_special` / `name_of` / `id_of` | A2 | -- |
 | `tokens.rollback` | A3 | `tokens.rollback.explicit`† (unreachable from the V1 program side; retained only as a kernel-internal equivalent path and future extension entry point); the model rollback envelope path goes through kernel internals |
 | `tokens.inject` | A4 | `tokens.inject`* + `tokens.inject.special`† (when reserved tokens are included) |
-| `session.current_handle` / `fork` / `restore` / `drop_fork` | A5 | `session.fork`* |
+| `session.current_handle` | A5 | `session.read` |
+| `session.fork` / `restore` / `drop_fork` | A5 | `session.fork`* |
 | `envelope.emit` | B3 | `envelope.emit` |
 | `scheduler.suspend` / `resume` | C1 / C2 | `scheduler.suspend` |
 | `scheduler.abort` | C3 | `scheduler.abort.own` or `scheduler.abort.any`† |
@@ -1239,7 +1242,7 @@ ctx.clock # I1
 SyscallError := { code, message, hint?, retryable, details?: Map<string, any>, cause? }
 ```
 
-> **Error details field** - `details` is an optional map used to carry finer-grained distinctions for the same error code. In particular, when `tokens.rollback` returns `E_ROLLBACK_PATTERN_NOT_FOUND`, `details.outcome ∈ {pattern_not_found, pattern_out_of_bound}` **MUST** be equivalent to the `outcome` field of the `rollback` audit from the same event; programs use this field to distinguish "no match at all" from "match outside the boundary". The remaining entries of `details` are defined independently by each error code (using the same criteria as the `origin` column in §15.2).
+> **Error details field** - `details` is an optional map used to carry finer-grained distinctions for the same error code. In particular, when the program path of `tokens.rollback` returns `E_ROLLBACK_PATTERN_NOT_FOUND`, `details.outcome` **MUST** be `pattern_not_found`; when it returns `E_ROLLBACK_BOUNDARY_HIT`, `details.outcome` **MUST** be `pattern_out_of_bound`, and both **MUST** be equivalent to the `outcome` field of the `rollback` audit from the same event. Older consumers may continue to read `details.outcome` to distinguish "no match at all" from "match outside the boundary", but new implementations should use the error code as the primary discriminator. The remaining entries of `details` are defined independently by each error code (using the same criteria as the `origin` column in §15.2).
 
 Handlers **MUST** report errors to the model (through `envelope.emit(kind=output, status=<code>)`); they **MUST NOT** swallow errors.
 
@@ -1359,8 +1362,8 @@ StreamFrame := { chunk_index: u32, total_chunks_hint: Option<u32>, stream_closed
 # * On the native pull-based `body: Stream<Bytes>` path, this **SHOULD** be `None`
 # until the generator is exhausted; conforming handlers **MUST NOT** use
 # `total_chunks_hint.is_some()` as a control-flow condition for anything other than progress display.
-# - stream_closed: `true` appears only in the frame of the final chunk
-# (whether from normal exhaustion or a generator exception that follows the close path); all other frames are false.
+# - stream_closed: `true` appears only in the terminal frame
+# (normal exhaustion, abort, timeout, and cancel all apply); all other frames are false.
 # - The only reliable end signal is `stream_closed=true`; program correctness **MUST NOT** depend on `total_chunks_hint` (as above).
 
 Handler := {
@@ -1380,6 +1383,7 @@ EnvelopeChunk := {
  visibility: string?,
  source_path: "program_emit_bytes" | "program_emit_stream" | "program_emit_buffered",
  frame: StreamFrame,
+ details: Map<string, any>? # terminal frame MUST contain terminate_reason
  tokens: &[Token]
 }
 
@@ -1388,11 +1392,13 @@ ChunkDecision := Continue | DetachObserver | AbortEnvelope
 
 > **`on_envelope_chunk` trigger rule** - When `features.envelope_chunk_observation="self-output-edit"`, every emitting handler call to `envelope.emit` with `kind ∈ {output, edit}` **MUST** cause the kernel to trigger `on_envelope_chunk` for body chunks, regardless of whether the body is Bytes or Stream. On the Bytes path, the kernel slices by `CHUNK_MAX_TOKENS` and invokes normative callbacks with monotonically increasing `chunk_index`, `total_chunks_hint=Some(n)`, and `stream_closed=true` on the final slice. On the native Stream path, `total_chunks_hint` **MAY** be `None`, and the only reliable end signal is still `stream_closed=true`. The L2 buffered path follows §6.5.2. The `tokens` visible to the callback are the token chunks that will ultimately be written into context, not the original bytes. `kind=execute` and `kind=rollback` do not trigger this callback. Kernel-generated system error envelopes (for example the ref.resolve failure error in §9.3) also **do not** trigger the self-output-edit observer; if a distribution provides a global observer extension, it **MUST** separately define filtering, deduplication, and loop-prevention rules.
 
+> **Terminal callback guarantee (normative)** - For every `envelope.emit(kind=output|edit)` that has entered the open-token injection path, if `features.envelope_chunk_observation="self-output-edit"` and the emitting handler registered `on_envelope_chunk`, the kernel **MUST** deliver exactly one terminal frame with `frame.stream_closed=true` on every termination path: normal exhaustion uses `details.terminate_reason="normal"`; observer / generator / external abort uses `"abort"`; write or dispatch timeout uses `"timeout"`; generator / async-iterator cancellation uses `"cancel"`. If no body tokens remain at termination, the terminal frame's `tokens` **MUST** be an empty slice rather than omitting the callback. The only exception is the L2 buffered reject-before-open path: because the open token has not yet been injected, it follows the §6.5.2 rejection semantics with `envelope_id="pending"` and **MUST NOT** synthesize a terminal callback.
+
 `ChunkDecision` semantics are as follows: `Continue` means continue consuming and injecting subsequent chunks; `DetachObserver` means stop subsequent chunk callbacks without aborting the envelope; for `AbortEnvelope` or a callback returning `Err`, the kernel **MUST** immediately follow a path equivalent to generator exception (stop pulling + cancel generator / async iterator + close + on_abort + audit `E_EMIT_STREAM_ABORTED` + details `reason="handler_reject_chunk"`). If the observer rejects before the open token is injected in L2 `buffered` mode, use the buffered reject special path in §6.5.2, without supplementing a close.
 
 > **Handler Context lifecycle** - `Context` is valid **only** within the current callback frame; handlers **MUST NOT** hold it across callbacks. The `ctx` received by `dispatch` / `on_envelope_chunk` / `on_event` / `resolve_ref` / `on_load` / `on_unload` / `on_abort` becomes invalid after that callback returns; calls through an invalid `ctx` are undefined behavior (a conforming kernel **MAY** report `E_KERNEL_INTERNAL`).
 
-> **Boundary between fork and handler-internal state** - A5 `session.fork` snapshots only kernel-managed state (context, KV cache, kernel metadata, capabilities, audit cursor, dispatcher frames, suspend handles, blob refcounts, and related state; see §9.4). The kernel does **not** automatically copy process-global variables, heap objects, connection pools, or other external mutable state inside native / host handlers. A conforming handler that stores session-related mutable internal state **MUST** partition it by `session_id` / fork branch, or persist that state in kernel-managed KV / blob / ref / region state. If a distribution provides a native backend and cannot guarantee this isolation, it **MUST** state in backend documentation that A5 fork covers only kernel-managed state, and **MUST NOT** let programs assume native internal state is automatically CoW-forked.
+> **Boundary between fork and handler-internal state** - A5 `session.fork` snapshots only kernel-managed state (context, KV cache, kernel metadata, capabilities, audit cursor, dispatcher frames, suspend handles, blob refcounts, and related state; see §9.4). The kernel does **not** automatically copy process-global variables, heap objects, connection pools, or other external mutable state inside native / host handlers. A conforming handler that stores session-related mutable internal state **MUST** partition it by `session_id` / fork branch, or persist that state in kernel-managed KV / blob / ref / region state. The `on_envelope_chunk` observer registration itself is **not** CoW-snapshotted by fork; it remains attached to the handler / program-registry reference and applies to whichever fork branch is currently dispatching. If a distribution provides a native backend and cannot guarantee this isolation, it **MUST** state in backend documentation that A5 fork covers only kernel-managed state and session ownership, and **MUST NOT** let programs assume native internal state or observer-private state is automatically CoW-forked.
 
 > **`on_load` loading state and visibility (normative)** - The semantic order of `program.register` is: (1) after manifest validation, the program is added to the registry; (2) namespaces (`program:<name>/` KV prefix, ref-kind registration, etc.) are set up; (3) the kernel calls `on_load(ctx)`. Between (1) and (3) the program is in **`status=loading`**; this paragraph defines the visibility and reachability constraints during that window:
 >
@@ -1547,6 +1553,7 @@ A5 fork applies to **the entire session state** (the following list is the norma
 - **`SESSION_FORK_MAX_DEPTH` / `SESSION_FORK_MAX_CONCURRENT` quota**: depth is inherited along the parent chain; concurrency counts independently against the root session.
 - **active Stream generator** (prohibited by the A5 precondition before fork): this restates consistency -- when a handler holds an unclosed streaming `envelope.emit`, it **MUST NOT** fork; there is no active Stream generator that needs to be copied with the session at fork time.
 - **handler-internal mutable state**: the fork snapshot does not include process-global variables, heap objects, connection pools, or other external mutable state inside native / host handlers. If such state is session-related, the handler **MUST** isolate it by `session_id` / fork branch, or store it in kernel-managed state (KV / blob / ref / region) before it participates in fork semantics. The kernel **MUST NOT** imply that such external state is automatically CoW-forked by A5.
+- **observer registrations and handler references**: handler callback registrations such as `on_envelope_chunk` follow the program-registry / handler reference, not a per-fork CoW snapshot; after fork, whichever branch is currently dispatching invokes that same handler registration with its own `session_id`. A native backend that needs per-branch private observer state **MUST** isolate that state by `session_id` / fork branch itself.
 
 `current_handle()` returns the `SessionHandle` of the current session without creating a fork, allocating a CoW snapshot, or counting against fork quotas. `fork()` returns a new `SessionHandle`, and the original session remains alive. `restore(handle)` switches into the target session, and the original session remains alive until `drop_fork`. A program that needs to move back and forth between parent and child branches **MUST** save the parent handle with `current_handle()` before switching into the child; it can later use `restore(parent_handle)` to return to the parent branch. This supports tree-of-thought, OOM protection, and transactional dispatch.
 
@@ -1784,6 +1791,8 @@ Each session has three sets:
 | `capabilities.requestable` | list at boot | Can be requested through the capability program |
 
 Effective set = fixed ∪ granted.
+
+`session.read` is an ordinary grantable V1 capability, granted to every registered program by default, and is used for side-effect-free queries such as reading the opaque handle of the current session and session metadata in runtime snapshots that are compatible with the caller's visibility. `session.fork` remains a high-privilege capability and controls only operations that create, switch, or release fork branches (`fork` / `restore` / `drop_fork`); an implementation **MUST NOT** allow a program to create or switch forks merely because it holds `session.read`.
 
 ## 11.3 Matching Rules
 
@@ -2399,7 +2408,7 @@ errors:
     notes: details.outcome distinguishes pattern_not_found from pattern_out_of_bound.
 ```
 
-> **Rollback boundary error expression** - Model-path out-of-bounds is expressed by `outcome=pattern_out_of_bound`; the program path has no legal trigger source. A conforming implementation **MUST NOT** produce `E_ROLLBACK_BOUNDARY` on any code path; substitutes are `E_ROLLBACK_PATTERN_NOT_FOUND` or `outcome=pattern_out_of_bound`. See the negative example entry in §16.4.
+> **Rollback boundary error expression** - Model-path out-of-bounds is still expressed by the `rollback(outcome=pattern_out_of_bound)` audit, and model-visible errors may continue to use `E_ROLLBACK_PATTERN_NOT_FOUND` + `details.outcome="pattern_out_of_bound"` for compatibility with existing consumers. If a distribution extension enables the program-path A3 entry and the nearest match exists but falls outside the effective boundary, it **MUST** return `E_ROLLBACK_BOUNDARY_HIT` as the primary error code; for compatibility with older handlers, details **MUST** still contain `outcome="pattern_out_of_bound"`, `effective_bound`, and `search_scope`. A conforming implementation **MUST NOT** produce the old name `E_ROLLBACK_BOUNDARY`.
 
 ```
 # A
@@ -2408,6 +2417,7 @@ E_MASK_INVALID
 E_ROLLBACK_STORM
 E_ROLLBACK_PATTERN_EMPTY
 E_ROLLBACK_PATTERN_NOT_FOUND # Distinguish not_found vs out_of_bound by outcome
+E_ROLLBACK_BOUNDARY_HIT # Primary program-path A3 boundary error; details.outcome retained for compatibility
 E_ROLLBACK_PATTERN_TOO_LONG
 E_ROLLBACK_PATTERN_INVALID
 E_INJECT_BAD_TOKEN
@@ -2523,7 +2533,7 @@ Every error code **MUST** define whether it is retryable in the distribution err
 
 - retryable: `E_NET_TIMEOUT`, `E_SUSPEND_EXPIRED`, `E_KV_QUOTA`, `E_CAP_WAIT_TIMEOUT`;
 - **not** retryable: `E_CAP_DENIED`, `E_UNKNOWN_PROGRAM`, `E_INJECT_BAD_TOKEN`, `E_EXEC_UNSUPPORTED`;
-- **not** retryable: `E_ROLLBACK_PATTERN_EMPTY` / `E_ROLLBACK_PATTERN_NOT_FOUND` / `E_ROLLBACK_PATTERN_TOO_LONG` / `E_ROLLBACK_PATTERN_INVALID` - all are model problems, and retry is ineffective;
+- **not** retryable: `E_ROLLBACK_PATTERN_EMPTY` / `E_ROLLBACK_PATTERN_NOT_FOUND` / `E_ROLLBACK_BOUNDARY_HIT` / `E_ROLLBACK_PATTERN_TOO_LONG` / `E_ROLLBACK_PATTERN_INVALID` - all are call-content or boundary problems, and retrying unchanged is ineffective;
 - **not** retryable: `E_ENV_KIND_FORBIDDEN`, `E_FORK_DEPTH_EXCEEDED` / `E_FORK_MEM_EXCEEDED` (the caller needs to first reduce depth / release forks before requesting again);
 - **not** retryable: `E_REF_KIND_TAKEN` / `E_REF_NOT_FOUND` / `E_REF_EXPIRED` / `E_REF_BODY_INVALID` - ref resolution errors are all orchestration or format problems (kind not registered, ref already expired, body microgrammar violation), and retry is meaningless.
 - **not** retryable: `E_BOOT_REFRESH_LIMIT` - the quota has already been reached within the current turn, so another trigger needs to wait until the next turn.
@@ -2574,7 +2584,7 @@ Implementations claiming "LMSC conforming" **MUST**:
 - **C-21** - `rollback` / `rollback_error` audit details **MUST** use `search_scope` for the rollback search range and **MUST NOT** emit `details.scope` in new audit records; top-level `AuditRecord.scope` represents audit visibility only. The storm-limit locked path for `rollback_error` details **MUST** include `storm_locked=true`.
 - **C-22** - Kernel-owned attribute headers, `envelope.emit` attrs, and region attrs that will be materialized as attribute headers **MUST** enforce the `ATTR_VALUE_MAX_BYTES` cap; if any attribute value exceeds the cap or contains a reserved-token literal, the relevant syscall / injection path **MUST** return `E_EMIT_ESCAPE_VIOLATION` or an equivalent binding-layer error and **MUST NOT** silently truncate. `gen` remains a per-program free string, and the kernel **MUST NOT** compare it across programs.
 - **C-23** - `features.envelope_chunk_observation="self-output-edit"` covers only output/edit chunks produced by the emitting handler itself through `envelope.emit(kind=output|edit)`; kernel-generated system error envelopes (including `ref.resolve` failure errors) **MUST NOT** trigger that observer.
-- **C-24** - An implementation that declares A5 support **MUST** provide `session.current_handle()`, and it uses the same `session.fork` cap as `session.fork()`. `current_handle()` **MUST NOT** create a fork, allocate a CoW snapshot, change context / KV / audit cursor / dispatcher frame, or count against fork depth / concurrency / memory quotas; the returned handle **MUST** be usable by a later `session.restore(handle)` to return to the current branch. L1 / L2 implementations **MUST** return `E_ATOMIC_UNSUPPORTED` for this entry.
+- **C-24** - An implementation that declares A5 support **MUST** provide `session.current_handle()`, and it uses the `session.read` cap; `session.fork()` / `session.restore()` / `session.drop_fork()` still use the `session.fork` cap. `current_handle()` **MUST NOT** create a fork, allocate a CoW snapshot, change context / KV / audit cursor / dispatcher frame, or count against fork depth / concurrency / memory quotas; the returned handle **MUST** be usable by a later `session.restore(handle)` to return to the current branch (the restore call still requires `session.fork`). L1 / L2 implementations **MUST** return `E_ATOMIC_UNSUPPORTED` for this entry.
 - **C-N1** - When `features.strict_protocol_mode=true` and `features.raw_text_outside_envelope="forbidden"` (§10.1.2), L0 / L1 implementations **MUST** enforce §4.4 `I-STRICT-ENVELOPE-ONLY` via logit mask in the sampler hook: at `GENERATING` with envelope stack depth = 0, all tokens other than `<lmsc_execute>` / `<lmsc_output>` / `<lmsc_edit>` / `<lmsc_rollback>` / `<|lmsc_suspend|>` / `<lmsc_ref>` open / EOS **MUST** be masked out (`<lmsc_ref>` open is included to stay consistent with `I-REF-ANY` -- a ref **MAY** appear in any envelope body and in ordinary chunks); L2 implementations follow item 10 of §6.5.1 to detect post-hoc and emit `kind=protocol_violation` (`invariant=I-STRICT-ENVELOPE-ONLY`). A successful expansion of a top-level ref must also satisfy the §9.3 strict top-level ref materialization rule. Both levels **MUST NOT** downgrade this constraint to "post-hoc discard" or "single-token truncation".
 - **C-N2** - When `features.raw_text_outside_envelope="audit-only"` (§10.1.2), each contiguous span of raw text observed at envelope stack depth = 0 **MUST** cause the kernel to emit a `kind=raw_text_outside_envelope` audit (§14.2; schema therein), and the kernel **MUST NOT** return `E_PROTOCOL_VIOLATION` and **MUST NOT** trigger abort. `audit-only` and `forbidden` are mutually exclusive; within the same turn the same span **MUST NOT** simultaneously emit `protocol_violation` and `raw_text_outside_envelope`.
 - **C-N3** - When `features.auto_execute_scaffold=true` (§10.1.2), the kernel-owned attribute header that immediately follows the kernel-injected `<lmsc_execute>` open **MUST** contain `id` and `from="model"`, and **MUST NOT** contain a `program` field; the dispatch target **MUST** still be parsed from the first word of the body after `</lmsc_execute>` close. Any implementation that pre-fills `program` into the scaffold attribute header and skips body-first-word routing on that basis is **non-conforming**.
@@ -2588,6 +2598,9 @@ Implementations claiming "LMSC conforming" **MUST**:
 - **C-N11** - Between `program.register` and the successful return of `on_load`, the program is in `status=loading` (§8.2). The kernel **MUST** return `E_PROG_NOT_FOUND` (preferably with `details.reason="loading"`) for any external B2 dispatch / syscall routing / scaffold path; the model-visible view of `program.list` **MUST** by default hide loading programs or mark them with `status="loading"`, while only `program.admin` callers and the program itself can observe its loading state during `on_load`. If `on_load` fails, the kernel **MUST** roll back the program-registry entry and namespace metadata and record the failure under existing audit rules.
 - **C-N12** - Any program call that uses `envelope_id="pending"` to reach an envelope-state syscall (continued `envelope.emit`, `envelope.close`, `region.*` queries / writes, `audit.emit`, `tokens.inject` with `AtEnvelopeClose`, etc.) - whether on the `on_envelope_chunk` reject path or inside `on_abort` - **MUST** be rejected by the kernel with `E_ABORT_NOT_OPEN` (preferably `details.reason="pending_not_open"`) and **SHOULD** emit `kind=protocol_violation` (§6.5.2). The kernel **MUST NOT** later remap a `pending` id to a final envelope id.
 - **C-N13** - When `ROLLBACK_SEARCH_MAX_BYTES` is set to a non-null value, the nearest match outside the independent lookback window **MUST** be audited as `outcome=pattern_out_of_bound`, `effective_bound="search_max_bytes"`, and **MUST NOT** be downgraded to `pattern_not_found`. When set to `null`: (a) structural boundaries still apply; (b) the pattern-matching implementation **MUST** run in `O(window_bytes + len(pattern))` linear time, with worst-case quadratic or higher complexity **forbidden**; (c) audit details **MUST** additionally expose `effective_search_window_bytes`, and `runtime info.stats` (if provided) **SHOULD** expose `rollback_search_max_bytes_effective` (§13.3). Under either setting, silent best-effort truncation followed by classification as `pattern_not_found` is **forbidden**.
+- **C-N14** - When `features.envelope_chunk_observation="self-output-edit"` is enabled and the emitting handler registered `on_envelope_chunk`, every `envelope.emit(kind=output|edit)` that has entered the open-token injection path **MUST** deliver one terminal callback with `frame.stream_closed=true` on normal / abort / timeout / cancel termination, and `details.terminate_reason` **MUST** be one of `normal` / `abort` / `timeout` / `cancel`; the L2 buffered reject-before-open path is the only exception (§8.2).
+- **C-N15** - A5 fork **MUST NOT** implicitly CoW-snapshot `on_envelope_chunk` observer registrations or native handler-private state per fork branch; observer registrations follow the handler / program-registry reference, and the currently dispatching fork branch invokes them with its own `session_id`. Native backends that store per-branch observer state **MUST** isolate it themselves (§8.2 / §9.4).
+- **C-N16** - If a distribution extension enables the program-path A3 entry and the match is out of bounds, the primary error code **MUST** be `E_ROLLBACK_BOUNDARY_HIT`, while details retain `outcome="pattern_out_of_bound"`; conforming implementations **MUST NOT** produce the old name `E_ROLLBACK_BOUNDARY` (§15.2). The model path remains expressed through the `rollback(outcome=pattern_out_of_bound)` audit.
 
 ### 16.1.1 Minimum Conformance Test Matrix
 
@@ -2636,7 +2649,7 @@ Implementations claiming "LMSC conforming" **MUST**:
 - Kernel depending on recommended programs such as `summarizer` to provide any capability from C-1 through C-10;
 - The action closed set having more or fewer than 7 entries;
 - The required program count is not 4.
-- Producing unregistered `E_ROLLBACK_BOUNDARY`, instead of expressing out-of-bounds with `rollback(outcome=pattern_out_of_bound)` or the program path's `E_ROLLBACK_PATTERN_NOT_FOUND` + `details.outcome=pattern_out_of_bound`.
+- Producing the old name `E_ROLLBACK_BOUNDARY`, instead of expressing out-of-bounds with `rollback(outcome=pattern_out_of_bound)` on the model path or `E_ROLLBACK_BOUNDARY_HIT` + `details.outcome="pattern_out_of_bound"` on the program path.
 
 ---
 
@@ -2679,6 +2692,7 @@ This table is the human-readable projection of `lmsc-capability-registry.yaml`; 
 | `tokens.rollback.explicit` | **no, fixed only** | kernel internals |
 | `tokens.inject` | yes | kernel internals; ordinary programs only after explicit authorization |
 | `tokens.inject.special` | **no, fixed only** | kernel internals; **MUST NOT** be exposed as a general A4 capability for persona-refresh |
+| `session.read` | yes | Every registered program by default |
 | `session.fork` | yes | `runtime` |
 | `scheduler.suspend` | yes | As needed |
 | `scheduler.abort.own` | yes | Every registered program by default |
@@ -2720,7 +2734,7 @@ This appendix expands every primitive in the §7.2 syscall table into method-lev
 | `tokens.id_of(name)` | A2 | -- | Same as above |
 | `tokens.rollback(pattern, scope)` | A3 | `tokens.rollback.explicit`† | V1 program side unreachable; model path uses kernel internals |
 | `tokens.inject(tokens, position)` | A4 | `tokens.inject`* (+`tokens.inject.special`† if reserved tokens are included) | ordinary calls while SUSPENDED return `E_INJECT_BAD_POSITION`; stack overflow returns `E_STACK_OVERFLOW` |
-| `session.current_handle()` | A5 | `session.fork`* | Unavailable under L1; does not create a fork |
+| `session.current_handle()` | A5 | `session.read` | Unavailable under L1; does not create a fork |
 | `session.fork()` | A5 | `session.fork`* | Unavailable under L1 |
 | `session.restore(handle)` | A5 | `session.fork`* | |
 | `session.drop_fork(handle)` | A5 | `session.fork`* | |

@@ -60,6 +60,8 @@ L3 <-up- L4 : 调用
 - LoRA 训练数据格式；
 - 前端 UI、Agent 策略、业务逻辑。
 
+> **实现与部署说明（非规范性）**· 本规范定义 rollback 的可观测语义和错误边界，但不要求基础模型在零训练条件下天然可靠地产生最优 `<lmsc_rollback>PATTERN</lmsc_rollback>` 截断点。生产发行版通常需要通过指令微调、偏好数据或适配层约束，让模型学会选择实际存在的 pattern、避免跨越 `I-ROLLBACK-BOUND`，并在边界命中时遵循 §15 的错误表达。该训练策略不属于合规面，但应纳入部署评估。
+
 ---
 
 > LMSC Kernel Specification draft v1
@@ -510,7 +512,7 @@ Scope := Envelope | Turn
  - 未命中（`pattern_not_found`）或命中区间有任意字节越界（`pattern_out_of_bound`）：不改变 KV；
  - emit audit `kind=rollback`，details 含 `outcome ∈ {truncated, pattern_not_found, pattern_out_of_bound}` / `search_scope` / `pattern_bytes_len` / `truncated_tokens`（`outcome=truncated` 时）。其中 `pattern_out_of_bound` 区分「整段上下文中 pattern 不存在」与「匹配区间有任意字节落在边界外」。`search_scope` 记录 A3 参数或模型路径推定值，避免与顶层 `AuditRecord.scope` 的可见性语义混用。
  - `ROLLBACK_STORM_LIMIT` 计数按 §13.3 口径执行：单 turn 内**成功**（`outcome=truncated`）与**失败**（`pattern_not_found` / `pattern_out_of_bound`）均计入同一计数器，不做区分。
-- **错误**：`E_ROLLBACK_STORM` / `E_ROLLBACK_PATTERN_EMPTY`/ `E_ROLLBACK_PATTERN_NOT_FOUND`/ `E_ROLLBACK_PATTERN_TOO_LONG`/ `E_ROLLBACK_PATTERN_INVALID`。
+- **错误**：`E_ROLLBACK_STORM` / `E_ROLLBACK_PATTERN_EMPTY` / `E_ROLLBACK_PATTERN_NOT_FOUND` / `E_ROLLBACK_BOUNDARY_HIT` / `E_ROLLBACK_PATTERN_TOO_LONG` / `E_ROLLBACK_PATTERN_INVALID`。程序路径（若由未来主版本或发行版扩展合法开启）在 `pattern_not_found` 时返 `E_ROLLBACK_PATTERN_NOT_FOUND`，在 `pattern_out_of_bound` 时返 `E_ROLLBACK_BOUNDARY_HIT`；两者 details 均**必须**保留同次 `rollback` audit 的 `outcome` 值。
 
 模型触发 `<lmsc_rollback>…</lmsc_rollback>` envelope 与程序调此原语**语义等价**；两条路径共享上述前置与不变量。模型路径未命中不报错，仅 emit audit。**模型路径 `scope` 推定**：当前为 `IN_ENVELOPE` → `Envelope`；当前为 `GENERATING` → `Turn`。程序路径的 syscall 签名不提供默认值，调用方**必须**显式传递 `scope`；语言绑定或 kernel 收到缺省/缺失 scope 时**必须**拒绝该调用并返回 `E_PROTOCOL_VIOLATION` 或绑定层等价错误。
 
@@ -581,7 +583,7 @@ session.drop_fork(handle: SessionHandle)-> Result<()> # 释放 fork
 
 - **前置**：
  - 实现级别**必须**为 **L0**（A5 在 L1 / L2 下不可用，调用返 `E_ATOMIC_UNSUPPORTED`）；
- - `current_handle`：持 `session.fork` cap；返回当前 session 的 `SessionHandle`，不创建新 fork、不分配 CoW snapshot、不计入 fork 深度 / 并发 / 内存配额；
+ - `current_handle`：持 `session.read` cap（默认授予所有注册程序；见 §7.2 / 附录 B）；返回当前 session 的 `SessionHandle`，不创建新 fork、不分配 CoW snapshot、不计入 fork 深度 / 并发 / 内存配额；
  - `fork`：**会话内任一 handler 均**禁止**持有进行中的流式 `envelope.emit`**；违反本条件时**必须**返 `E_EMIT_STREAM_OPEN`，details 至少包含 `open_stream_count`，并应包含可暴露的未关闭 `envelope_id` 列表；持 `session.fork` cap。dispatch 内调用合法——`runtime admin fork`（§12.3）即依赖本路径。（流式 emit 未完结时不可分）
  - **Fork 配额检查**（与附录 F.3 规范常量及 §15.2 已登记错误码正式联动）· kernel **必须**在 CoW KV snapshot 分配 **之前**执行以下三项检查，按下列顺序返回错误，且并发场景下指配-分配间隙穿越**必须**防护（配额检查 + CoW 分配**必须**对同一 root session 持互斥锁或等价语义）：
  1. **深度**：若自根 session 起向下的 fork 链深度 ≥ `SESSION_FORK_MAX_DEPTH`（附录 F.3；默认 8），返 `E_FORK_DEPTH_EXCEEDED`，audit details `reason="depth_limit"`；
@@ -595,7 +597,7 @@ session.drop_fork(handle: SessionHandle)-> Result<()> # 释放 fork
  - `drop_fork` 释放对应 CoW 引用。
 - **错误**：`E_FORK_INVALID` / `E_EMIT_STREAM_OPEN` / `E_FORK_OOM` / `E_FORK_DEPTH_EXCEEDED` / `E_FORK_MEM_EXCEEDED`（触发条件见上述前置配额检查；retryable 归属见 §15.3）。
 - **备注**：明确采用 **fork 语义**。支持 tree-of-thought、OOM 保护、事务化 dispatch。
-- **`SessionHandle` 类型**· `SessionHandle` 为内存句柄（不透明类型）；**禁止**序列化、**禁止**跨 session 持久化；仅当前 kernel 实例生命周期内有效。`current_handle()` 与 `fork()` 返回同一类 handle；程序可在 `restore(child)` 前保存父 session handle，随后用 `restore(parent)` 回到父分支。跨进程 / 跨部署举持该 handle **必须**返 `E_FORK_INVALID`。
+- **`SessionHandle` 类型**· `SessionHandle` 为内存句柄（不透明类型）；**禁止**序列化、**禁止**跨 session 持久化；仅当前 kernel 实例生命周期内有效。`current_handle()` 与 `fork()` 返回同一类 handle，但读取当前 handle 与创建 / 切换 fork 的能力分离：`current_handle()` 只需 `session.read`，`fork()` / `restore()` / `drop_fork()` 仍需 `session.fork`。程序可在 `restore(child)` 前保存父 session handle，随后用 `restore(parent)` 回到父分支。跨进程 / 跨部署举持该 handle **必须**返 `E_FORK_INVALID`。
 
 ## 5.3 B · Envelope 结构
 
@@ -1205,7 +1207,8 @@ ctx.clock # I1
 | `tokens.is_special` / `name_of` / `id_of` | A2 | — |
 | `tokens.rollback` | A3 | `tokens.rollback.explicit`†（V1 程序侧不可达；仅保留为 kernel 内部等价路径与未来扩展入口）；模型 rollback envelope 路径走 kernel 内部 |
 | `tokens.inject` | A4 | `tokens.inject`* + `tokens.inject.special`†（含保留 token 时） |
-| `session.current_handle` / `fork` / `restore` / `drop_fork` | A5 | `session.fork`* |
+| `session.current_handle` | A5 | `session.read` |
+| `session.fork` / `restore` / `drop_fork` | A5 | `session.fork`* |
 | `envelope.emit` | B3 | `envelope.emit` |
 | `scheduler.suspend` / `resume` | C1 / C2 | `scheduler.suspend` |
 | `scheduler.abort` | C3 | `scheduler.abort.own` 或 `scheduler.abort.any`† |
@@ -1238,7 +1241,7 @@ ctx.clock # I1
 SyscallError := { code, message, hint?, retryable, details?: Map<string, any>, cause? }
 ```
 
-> **错误细节字段** · `details` 为 optional map，用于承载对同一错误码的更细粒度区分。特别地，`tokens.rollback` 返 `E_ROLLBACK_PATTERN_NOT_FOUND` 时，`details.outcome ∈ {pattern_not_found, pattern_out_of_bound}` **必须**与同次事件 `rollback` audit 的 `outcome` 字段等效；程序以该字段区分“完全无匹配”与“匹配在边界外”。`details` 的其余条目由各错误码自行定义（与 §15.2 `origin` 列同口径）。
+> **错误细节字段** · `details` 为 optional map，用于承载对同一错误码的更细粒度区分。特别地，`tokens.rollback` 程序路径返 `E_ROLLBACK_PATTERN_NOT_FOUND` 时，`details.outcome` **必须**为 `pattern_not_found`；返 `E_ROLLBACK_BOUNDARY_HIT` 时，`details.outcome` **必须**为 `pattern_out_of_bound`，且两者均**必须**与同次事件 `rollback` audit 的 `outcome` 字段等效。旧消费者可继续读取 `details.outcome` 区分“完全无匹配”与“匹配在边界外”，但新实现应以错误码作为主判别。`details` 的其余条目由各错误码自行定义（与 §15.2 `origin` 列同口径）。
 
 Handler **必须** 向模型回报错误（通过 `envelope.emit(kind=output, status=<code>)`）；**禁止** 吞错。
 
@@ -1358,8 +1361,8 @@ StreamFrame := { chunk_index: u32, total_chunks_hint: Option<u32>, stream_closed
 # * `body: Stream<Bytes>` 原生 pull-based 路径下**应**为 `None`
 # 直到 generator 耗尽；合规 handler **禁止**把
 # `total_chunks_hint.is_some()` 作为除进度展示外的任何控制流判据。
-# - stream_closed：`true` 仅出现在最后一个 chunk 的 frame 中
-#（无论是正常耗尽还是因 generator 抛错走 close 路径）；其余 frame 为 false。
+# - stream_closed：`true` 仅出现在终止 frame 中
+#（正常耗尽、abort、timeout、cancel 均适用）；其余 frame 为 false。
 # - 唯一可靠结束信号为 `stream_closed=true`；程序正确性 **禁止** 依赖 `total_chunks_hint`（同上）。
 
 Handler := {
@@ -1379,6 +1382,7 @@ EnvelopeChunk := {
  visibility: string?,
  source_path: "program_emit_bytes" | "program_emit_stream" | "program_emit_buffered",
  frame: StreamFrame,
+ details: Map<string, any>? # 终止 frame 必须含 terminate_reason
  tokens: &[Token]
 }
 
@@ -1387,11 +1391,13 @@ ChunkDecision := Continue | DetachObserver | AbortEnvelope
 
 > **`on_envelope_chunk` 触发规则** · 当 `features.envelope_chunk_observation="self-output-edit"` 时，凡 emitting handler 调用 `envelope.emit` 且 `kind ∈ {output, edit}`，kernel 均**必须**对 body chunk 触发 `on_envelope_chunk`，无论 body 是 Bytes 还是 Stream。Bytes 路径下 kernel 按 `CHUNK_MAX_TOKENS` 切片并按 `chunk_index` 单调递增、`total_chunks_hint=Some(n)`、最后一片 `stream_closed=true` 的规范回调。原生 Stream 路径下 `total_chunks_hint` 可为 `None`，唯一可靠结束信号仍是 `stream_closed=true`。L2 buffered 路径按 §6.5.2 处理。回调看到的 `tokens` 是最终将写入 context 的 token chunk，不是原始 bytes。`kind=execute` 与 `kind=rollback` 不触发本回调。kernel 直接生成的系统错误 envelope（例如 §9.3 的 ref.resolve 失败错误）也**不**触发 self-output-edit observer；若发行版提供全局 observer 扩展，**必须**另行定义过滤、去重与防循环规则。
 
+> **终止回调保证（规范性）**· 对每个已进入 open-token 注入路径的 `envelope.emit(kind=output|edit)`，只要 `features.envelope_chunk_observation="self-output-edit"` 且 emitting handler 注册了 `on_envelope_chunk`，kernel **必须**在所有终止路径上交付一个且仅一个 `frame.stream_closed=true` 的终止 frame：正常耗尽为 `details.terminate_reason="normal"`，observer / generator / 外部 abort 为 `"abort"`，写入或 dispatch timeout 为 `"timeout"`，取消 generator / async iterator 为 `"cancel"`。若终止时没有剩余 body token，终止 frame 的 `tokens` **必须**为空切片而非省略回调。唯一例外是 L2 buffered reject-before-open 路径：open token 尚未注入时按 §6.5.2 使用 `envelope_id="pending"` 的拒绝语义，**不得**补发终止回调。
+
 `ChunkDecision` 语义如下：`Continue` 表示继续消费并注入后续 chunk；`DetachObserver` 表示停止后续 chunk 回调但不 abort envelope；`AbortEnvelope` 或回调返回 `Err` 时，kernel **必须**立即走 generator 异常等价路径（停止 pull + 取消 generator / async iterator + close + on_abort + audit `E_EMIT_STREAM_ABORTED` + details `reason="handler_reject_chunk"`）。若 L2 `buffered` 模式下 observer 在 open token 注入前拒绝，按 §6.5.2 的 buffered reject 专用路径处理，不补 close。
 
 > **Handler Context 生命周期**· `Context` **仅**在当前 callback 帧内有效；handler **禁止**跨 callback 持有。`dispatch` / `on_envelope_chunk` / `on_event` / `resolve_ref` / `on_load` / `on_unload` / `on_abort` 各自收到的 `ctx` 在该 callback 返回后作废；程序对失效 `ctx` 的调用为未定义行为（合规 kernel **可** 报 `E_KERNEL_INTERNAL`）。
 
-> **Fork 与 handler 内部状态边界**· A5 `session.fork` 只快照 kernel-managed state（context、KV cache、kernel 元数据、cap、audit、dispatcher frame、suspend handle、blob refcount 等，见 §9.4）；kernel **不** 自动复制 native / 宿主 handler 的进程内全局变量、堆对象、连接池或其他外部可变状态。合规 handler 若保存与 session 有关的内部可变状态，**必须**按 `session_id` / fork branch 隔离，或把该状态持久化到 kernel 管理的 KV / blob / ref / region 中。发行版若提供 native backend 且不能保证此隔离，**必须**在 backend 文档中声明 A5 fork 仅覆盖 kernel-managed state，**禁止**让程序假设 native 内部状态随 fork 自动 CoW。
+> **Fork 与 handler 内部状态边界**· A5 `session.fork` 只快照 kernel-managed state（context、KV cache、kernel 元数据、cap、audit、dispatcher frame、suspend handle、blob refcount 等，见 §9.4）；kernel **不** 自动复制 native / 宿主 handler 的进程内全局变量、堆对象、连接池或其他外部可变状态。合规 handler 若保存与 session 有关的内部可变状态，**必须**按 `session_id` / fork branch 隔离，或把该状态持久化到 kernel 管理的 KV / blob / ref / region 中。`on_envelope_chunk` observer 注册本身**不**随 fork 做 CoW 快照；它附着在 handler / program registry 引用上，并作用于当前正在 dispatch 的 fork 分支。发行版若提供 native backend 且不能保证此隔离，**必须**在 backend 文档中声明 A5 fork 仅覆盖 kernel-managed state 与 session 归属，**禁止**让程序假设 native 内部状态或 observer 私有状态随 fork 自动 CoW。
 
 > **`on_load` loading 状态与可见性（规范性）**· `program.register` 的语义顺序为：(1) manifest 校验通过后程序入表，(2) 命名空间（`program:<name>/` KV 前缀、ref kind 注册等）就绪，(3) kernel 调 `on_load(ctx)`。在 (1)–(3) 之间程序处于 **`status=loading`** 状态；本节定义此状态下的可见性与可达性约束：
 >
@@ -1546,6 +1552,7 @@ A5 的 fork 对**整个会话状态** 有效（以下清单为规范性完整快
 - **`SESSION_FORK_MAX_DEPTH` / `SESSION_FORK_MAX_CONCURRENT` 配额**：深度沿父链继承；并发计入根 session 独立。
 - **活跃 Stream generator**（fork 前置A5 已**禁止**）：此处重申一致性——handler 持有未关闭的 streaming `envelope.emit` 时**禁止** fork；fork 时无活跃 Stream generator 需隨 session 复制。
 - **handler 内部可变状态**：fork 快照不包含 native / 宿主 handler 的进程内全局变量、堆对象、连接池或其他外部可变状态；这些状态若与 session 相关，必须由 handler 按 `session_id` / fork branch 自行隔离，或落到 kernel-managed state（KV / blob / ref / region）后再参与 fork 语义。kernel **禁止**暗示此类外部状态会随 A5 自动 CoW。
+- **observer 注册与 handler 引用**：`on_envelope_chunk` 等 handler callback 注册跟随 program registry / handler 引用，而非按 fork 分支做 CoW 快照；fork 后哪个分支正在 dispatch，就由该分支以自己的 `session_id` 调用同一个 handler 注册。需要 per-branch 私有 observer 状态的 native backend **必须**自行按 `session_id` / fork branch 隔离。
 
 `current_handle()` 返回当前 session 的 `SessionHandle`，不创建 fork、不分配 CoW snapshot、不计入 fork 配额。`fork()` 返回新 `SessionHandle`，原会话继续存活。`restore(handle)` 切入目标 session，原 session 仍存活直到 `drop_fork`。程序若需要在父 / 子分支之间来回切换，**必须**在切入子分支前通过 `current_handle()` 保存父 handle；随后可用 `restore(parent_handle)` 回到父分支。这支持 tree-of-thought、OOM 保护、事务化 dispatch。
 
@@ -1783,6 +1790,8 @@ capability := category "." verb [ "." qualifier ] [ ":" scope ]
 | `capabilities.requestable` | boot 时列表 | 可通过 capability 程序申请 |
 
 生效集 = fixed ∪ granted。
+
+`session.read` 是 V1 的普通可 grant capability，默认授予所有注册程序，用于读取当前 session 的不透明 handle、runtime 快照中与自身可见性相容的 session 元数据等无副作用查询。`session.fork` 仍是高权限 capability，仅控制 `fork` / `restore` / `drop_fork` 这类会创建、切换或释放 fork 分支的操作；实现**禁止**因为程序持有 `session.read` 而允许其创建或切换 fork。
 
 ## 11.3 匹配规则
 
@@ -2398,7 +2407,7 @@ errors:
     notes: details.outcome distinguishes pattern_not_found from pattern_out_of_bound.
 ```
 
-> **Rollback 边界错误表达** · 模型路径越界由 `outcome=pattern_out_of_bound` 表达，程序路径无合法触发源。合规实现 **禁止**（**禁止**）在任何代码路径中产生 `E_ROLLBACK_BOUNDARY`；替代值为 `E_ROLLBACK_PATTERN_NOT_FOUND` 或 `outcome=pattern_out_of_bound`。见 §16.4 反面例子条目。
+> **Rollback 边界错误表达** · 模型路径越界仍由 `rollback(outcome=pattern_out_of_bound)` audit 表达，且模型可见错误可继续使用 `E_ROLLBACK_PATTERN_NOT_FOUND` + `details.outcome="pattern_out_of_bound"` 兼容旧消费者。程序路径 A3 若未来由发行版扩展开启且发现最近匹配存在但落在有效边界外，**必须**以 `E_ROLLBACK_BOUNDARY_HIT` 作为主错误码返回；为兼容旧处理器，details **仍必须**包含 `outcome="pattern_out_of_bound"`、`effective_bound` 与 `search_scope`。合规实现 **禁止**产生旧名 `E_ROLLBACK_BOUNDARY`。
 
 ```
 # A
@@ -2407,6 +2416,7 @@ E_MASK_INVALID
 E_ROLLBACK_STORM
 E_ROLLBACK_PATTERN_EMPTY
 E_ROLLBACK_PATTERN_NOT_FOUND # 依 outcome 区分 not_found vs out_of_bound
+E_ROLLBACK_BOUNDARY_HIT # 程序路径 A3 越界主错误码；details.outcome 保留兼容
 E_ROLLBACK_PATTERN_TOO_LONG
 E_ROLLBACK_PATTERN_INVALID
 E_INJECT_BAD_TOKEN
@@ -2522,7 +2532,7 @@ E_FORK_MEM_EXCEEDED
 
 - retryable: `E_NET_TIMEOUT`、`E_SUSPEND_EXPIRED`、`E_KV_QUOTA`、`E_CAP_WAIT_TIMEOUT`；
 - **不** retryable：`E_CAP_DENIED`、`E_UNKNOWN_PROGRAM`、`E_INJECT_BAD_TOKEN`、`E_EXEC_UNSUPPORTED`；
-- **不** retryable：`E_ROLLBACK_PATTERN_EMPTY` / `E_ROLLBACK_PATTERN_NOT_FOUND` / `E_ROLLBACK_PATTERN_TOO_LONG` / `E_ROLLBACK_PATTERN_INVALID`——均为模型问题，重试无效；
+- **不** retryable：`E_ROLLBACK_PATTERN_EMPTY` / `E_ROLLBACK_PATTERN_NOT_FOUND` / `E_ROLLBACK_BOUNDARY_HIT` / `E_ROLLBACK_PATTERN_TOO_LONG` / `E_ROLLBACK_PATTERN_INVALID`——均为调用内容或边界问题，原样重试无效；
 - **不** retryable：`E_ENV_KIND_FORBIDDEN`、`E_FORK_DEPTH_EXCEEDED` / `E_FORK_MEM_EXCEEDED`（需先缩减深度/释放 fork 后重新请求）；
 - **不** retryable：`E_REF_KIND_TAKEN` / `E_REF_NOT_FOUND` / `E_REF_EXPIRED` / `E_REF_BODY_INVALID`——ref 解析类错误，均为编排或格式问题（kind 未注册、ref 已过期、body 微文法违规），重试无意义。
 - **不** retryable：`E_BOOT_REFRESH_LIMIT`——单 turn 内已达配额，需等下一 turn 才可再次触发。
@@ -2573,7 +2583,7 @@ E_FORK_MEM_EXCEEDED
 - **C-21** · `rollback` / `rollback_error` audit details **必须**使用 `search_scope` 表示 rollback 搜索范围，**禁止**在新 audit 中 emit `details.scope`；顶层 `AuditRecord.scope` 仅表示审计可见性。storm-limit 锁定路径的 `rollback_error` details **必须**包含 `storm_locked=true`。
 - **C-22** · kernel-owned attribute header、`envelope.emit` attrs 与会被 materialize 为 attribute header 的 region attrs **必须**执行 `ATTR_VALUE_MAX_BYTES` 上限；任一属性值超限或含保留 token 字面时，相关 syscall / 注入路径**必须**返回 `E_EMIT_ESCAPE_VIOLATION` 或绑定层等价错误，**禁止**静默截断。`gen` 仍是 per-program 自由字符串，kernel **禁止**跨程序比较。
 - **C-23** · `features.envelope_chunk_observation="self-output-edit"` 只覆盖 emitting handler 自己通过 `envelope.emit(kind=output|edit)` 产生的 output/edit chunk；kernel 直接生成的系统错误 envelope（含 `ref.resolve` 失败错误）**不得**触发该 observer。
-- **C-24** · 声明支持 A5 的实现**必须**提供 `session.current_handle()`，且它与 `session.fork()` 使用同一 `session.fork` cap。`current_handle()` **不得**创建 fork、分配 CoW snapshot、改变 context / KV / audit cursor / dispatcher frame，或计入 fork 深度 / 并发 / 内存配额；其返回 handle **必须**可用于后续 `session.restore(handle)` 回到当前分支。L1 / L2 实现调用该入口**必须**返回 `E_ATOMIC_UNSUPPORTED`。
+- **C-24** · 声明支持 A5 的实现**必须**提供 `session.current_handle()`，且它使用 `session.read` cap；`session.fork()` / `session.restore()` / `session.drop_fork()` 仍使用 `session.fork` cap。`current_handle()` **不得**创建 fork、分配 CoW snapshot、改变 context / KV / audit cursor / dispatcher frame，或计入 fork 深度 / 并发 / 内存配额；其返回 handle **必须**可用于后续 `session.restore(handle)` 回到当前分支（调用 restore 时仍需 `session.fork`）。L1 / L2 实现调用该入口**必须**返回 `E_ATOMIC_UNSUPPORTED`。
 - **C-N1** · 当 `features.strict_protocol_mode=true` 且 `features.raw_text_outside_envelope="forbidden"` 时（§10.1.2），L0 / L1 实现**必须**在 sampler hook 中以 logit mask 强制 §4.4 `I-STRICT-ENVELOPE-ONLY`：在 `GENERATING` 状态且 envelope 栈深 = 0 处，`<lmsc_execute>` / `<lmsc_output>` / `<lmsc_edit>` / `<lmsc_rollback>` / `<|lmsc_suspend|>` / `<lmsc_ref>` open / EOS 之外的所有 token **必须**被 mask 屏蔽（`<lmsc_ref>` open 纳入入口集是为与 `I-REF-ANY` 保持一致——ref **可**出现在任何 envelope body 与普通 chunk 中）；L2 实现按 §6.5.1 第 10 条事后识别后走 `kind=protocol_violation`（`invariant=I-STRICT-ENVELOPE-ONLY`）。栈深 0 的 ref 成功展开还必须满足 §9.3 strict 顶层 ref materialization 规则。**禁止**两级实现把本约束降级为「事后丢弃」或「截断单 token」。
 - **C-N2** · 当 `features.raw_text_outside_envelope="audit-only"` 时（§10.1.2），envelope 栈深 = 0 处出现的连续裸文本 span，kernel **必须** emit `kind=raw_text_outside_envelope` audit（§14.2，schema 见同节），且**禁止**返 `E_PROTOCOL_VIOLATION`、**禁止**触发 abort。`audit-only` 与 `forbidden` 互斥；同一 turn 内**禁止**对同一 span 同时 emit `protocol_violation` 与 `raw_text_outside_envelope`。
 - **C-N3** · 当 `features.auto_execute_scaffold=true` 时（§10.1.2），kernel 注入的 `<lmsc_execute>` open 紧随的 kernel-owned 属性头**必须**含 `id` 与 `from="model"`，且**禁止**含 `program` 字段；调度目标**必须**仍由 `</lmsc_execute>` close 后的 body 首词解析。任何把 `program` 预填入 scaffold 属性头并据此跳过 body 首词路由的实现**不**合规。
@@ -2587,6 +2597,9 @@ E_FORK_MEM_EXCEEDED
 - **C-N11** · 程序 `register` 后至 `on_load` 成功返回前，程序处于 `status=loading`（§8.2）。kernel **必须**对外部 B2 dispatch / syscall 路由 / scaffold 等任何路径返 `E_PROG_NOT_FOUND`（建议 `details.reason="loading"`）；`program.list` 模型可见视图**必须**默认隐藏 loading 程序或带 `status="loading"` 标记，仅 `program.admin` 与程序自身可在 `on_load` 期间观察到自己；`on_load` 失败时 kernel **必须**回滚程序入表与命名空间 metadata，并按既有 audit 规则记录。
 - **C-N12** · 任何在 `on_envelope_chunk` reject 路径或 `on_abort` 中以 `envelope_id="pending"` 触达 envelope-state syscall（envelope.emit 续写、envelope.close、region.* 查询/写入、audit.emit、tokens.inject AtEnvelopeClose 等）的程序调用，kernel **必须**返 `E_ABORT_NOT_OPEN`（建议 `details.reason="pending_not_open"`）并 emit `kind=protocol_violation`（§6.5.2）。`pending` id **禁止**被 kernel 重映射为最终 envelope id。
 - **C-N13** · 当 `ROLLBACK_SEARCH_MAX_BYTES` 设为非 null 时，超出独立 lookback 窗的最近匹配**必须** audit `outcome=pattern_out_of_bound`、`effective_bound="search_max_bytes"`，**禁止**降级为 `pattern_not_found`。当设为 null 时 (a) 结构边界仍生效；(b) 模式匹配实现**必须**为 `O(window_bytes + len(pattern))` 线性时间，**禁止**最坏二次或更高复杂度；(c) audit details **必须**额外暴露 `effective_search_window_bytes`，且 `runtime info.stats`（若提供）**应**暴露 `rollback_search_max_bytes_effective`（§13.3）。任一设置下**禁止**静默 best-effort 截断后归为 `pattern_not_found`。
+- **C-N14** · 当 `features.envelope_chunk_observation="self-output-edit"` 且 emitting handler 注册 `on_envelope_chunk` 时，每个已进入 open-token 注入路径的 `envelope.emit(kind=output|edit)` **必须**在 normal / abort / timeout / cancel 任一终止路径上交付一个 `frame.stream_closed=true` 的终止 callback，并在 `details.terminate_reason` 中使用 `normal` / `abort` / `timeout` / `cancel` 之一；L2 buffered reject-before-open 路径是唯一例外（§8.2）。
+- **C-N15** · A5 fork **不得**把 `on_envelope_chunk` observer 注册或 native handler 私有状态按 fork 分支做隐式 CoW；observer 注册跟随 handler / program registry 引用，当前 dispatch 的 fork 分支以自身 `session_id` 调用它。native backend 若保存 per-branch observer 状态，**必须**自行隔离（§8.2 / §9.4）。
+- **C-N16** · 程序路径 A3 若由发行版扩展开启且命中越界，主错误码**必须**为 `E_ROLLBACK_BOUNDARY_HIT`，同时 details 保留 `outcome="pattern_out_of_bound"`；合规实现**禁止**产生旧名 `E_ROLLBACK_BOUNDARY`（§15.2）。模型路径仍以 `rollback(outcome=pattern_out_of_bound)` audit 表达。
 
 ### 16.1.1 最小合规测试矩阵
 
@@ -2635,7 +2648,7 @@ E_FORK_MEM_EXCEEDED
 - kernel 依赖 `summarizer` 等推荐程序以提供 C-1 到 C-10 的任一能力；
 - action 闭集多于 7 条或少于 7 条；
 - 必要程序不是 4 个。
-- 产生未登记的 `E_ROLLBACK_BOUNDARY`，而不是用 `rollback(outcome=pattern_out_of_bound)` 或程序路径的 `E_ROLLBACK_PATTERN_NOT_FOUND` + `details.outcome=pattern_out_of_bound` 表达越界。
+- 产生旧名 `E_ROLLBACK_BOUNDARY`，而不是在模型路径用 `rollback(outcome=pattern_out_of_bound)`、在程序路径用 `E_ROLLBACK_BOUNDARY_HIT` + `details.outcome="pattern_out_of_bound"` 表达越界。
 
 ---
 
@@ -2678,6 +2691,7 @@ E_FORK_MEM_EXCEEDED
 | `tokens.rollback.explicit` | **no, fixed only** | kernel 内部 |
 | `tokens.inject` | yes | kernel 内部；普通程序仅在显式授权后可用 |
 | `tokens.inject.special` | **no, fixed only** | kernel 内部；**禁止**作为 persona-refresh 的一般 A4 能力暴露 |
+| `session.read` | yes | 每个注册程序默认 |
 | `session.fork` | yes | `runtime` |
 | `scheduler.suspend` | yes | 按需 |
 | `scheduler.abort.own` | yes | 每个注册程序默认 |
@@ -2719,7 +2733,7 @@ E_FORK_MEM_EXCEEDED
 | `tokens.id_of(name)` | A2 | — | 同上 |
 | `tokens.rollback(pattern, scope)` | A3 | `tokens.rollback.explicit`† | V1 程序侧不可达；model 路径走 kernel 内部 |
 | `tokens.inject(tokens, position)` | A4 | `tokens.inject`* (+`tokens.inject.special`† 若含保留 token) | SUSPENDED 下普通调用返 `E_INJECT_BAD_POSITION`；栈溢出返 `E_STACK_OVERFLOW` |
-| `session.current_handle()` | A5 | `session.fork`* | L1 下不可用；不创建 fork |
+| `session.current_handle()` | A5 | `session.read` | L1 下不可用；不创建 fork |
 | `session.fork()` | A5 | `session.fork`* | L1 下不可用 |
 | `session.restore(handle)` | A5 | `session.fork`* | |
 | `session.drop_fork(handle)` | A5 | `session.fork`* | |
