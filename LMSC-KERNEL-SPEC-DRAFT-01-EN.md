@@ -62,6 +62,7 @@ L3 <-up- L4 : invokes
 
 ---
 
+
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
 > Protocol revision: `draft v1`.
@@ -101,6 +102,7 @@ L3 <-up- L4 : invokes
 
 ---
 
+
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
 > Protocol revision: `draft v1`.
@@ -119,6 +121,7 @@ This document uses the keywords from [RFC 2119] and [RFC 8174]:
 The subject of "the kernel **MUST**..." is a conforming implementation. The subject of "a program **MUST**..." is a program deployed on a conforming kernel.
 
 ---
+
 
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
@@ -187,6 +190,7 @@ Programs do not communicate directly with each other. Cross-program collaboratio
 **P-5 - No Cross-Layer Dependency** - Normative clauses and the behavior of required programs **MUST NOT** depend on the presence of recommended or ecosystem programs.
 
 ---
+
 
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
@@ -423,7 +427,7 @@ The entries are as follows:
 - **I-ATTR-CLEAN** - The kernel-owned attribute header ends at the blank-line boundary; the attribute header **MUST NOT** contain any special token literal, and the header prefix, separator before the first attribute, line ending, blank line, and attribute-value length cap **MUST** conform to §4.3 / §4.2.
 - **I-EMIT-ESCAPE** - When injecting the bytes body of `envelope.emit`, rewriting a `net` response into an envelope body, injecting the `replacement` bytes of `region.edit`, or injecting visible text for `ref.resolve` failure, the kernel **MUST** escape reserved-token literal characters (§13.2).
 - **I-REF-CHARSET** - The body of `<lmsc_ref>...</lmsc_ref>` **MUST** exactly conform to the micro-grammar `kind: "{kind}";id: "{id}";` (`{kind}` / `{id}` are placeholders); both values are limited to ASCII `[A-Za-z0-9_.:/-]` and **MUST NOT** be empty strings; violations **MUST** be rejected, emit `kind=protocol_violation`, and return `E_REF_BODY_INVALID`.
-- **I-STRICT-ENVELOPE-ONLY** (**conditional invariant**, enabled only when `features.strict_protocol_mode=true` and `features.raw_text_outside_envelope="forbidden"`) - When the state is `GENERATING` and the envelope stack depth = 0, the next token sampled by the model **MUST** belong to the "legal LMSC protocol entry" set: one of `<lmsc_execute>` / `<lmsc_output>` / `<lmsc_edit>` / `<lmsc_rollback>` / `<|lmsc_suspend|>` / `<lmsc_ref>` open / EOS; any non-entry ordinary token is treated as a violation. `<lmsc_ref>` open is included in the entry set to stay consistent with `I-REF-ANY` (a ref **MAY** appear in any envelope body and in ordinary chunks); after the ref envelope closes the stack depth is still 0, and the immediately following token remains subject to this invariant. L0 / L1 **MUST** enforce this in the sampler hook via logit mask before sampling; L2 detects violations post-hoc in the token stream hook and routes through `kind=protocol_violation` (invariant=`I-STRICT-ENVELOPE-ONLY`) the same way as §6.5.1 item 10, returning `E_PROTOCOL_VIOLATION`. When `raw_text_outside_envelope="audit-only"`, the invariant is **not** enforced, but the kernel **MUST** emit audit `kind=raw_text_outside_envelope` (which does not constitute a violation). When `raw_text_outside_envelope="allowed"` or `strict_protocol_mode=false`, the invariant is **not** active, preserving the existing compatibility behavior.
+- **I-STRICT-ENVELOPE-ONLY** (**conditional invariant**, enabled only when `features.strict_protocol_mode=true` and `features.raw_text_outside_envelope="forbidden"`) - When the state is `GENERATING` and the envelope stack depth = 0, the next token sampled by the model **MUST** belong to the "legal LMSC protocol entry" set: one of `<lmsc_execute>` / `<lmsc_output>` / `<lmsc_edit>` / `<lmsc_rollback>` / `<|lmsc_suspend|>` / `<lmsc_ref>` open / EOS; any non-entry ordinary token is treated as a violation. `<lmsc_ref>` open is included in the entry set to stay consistent with `I-REF-ANY` (a ref **MAY** appear in any envelope body and in ordinary chunks); after the ref element closes the stack depth is still 0, and the immediately following token remains subject to this invariant. If that ref element was opened while this invariant was active and the stack depth was 0, a successful expansion result **MUST** also follow the strict top-level ref materialization rule in §9.3; the kernel **MUST NOT** write ordinary bytes returned by the resolver directly into context outside an envelope merely after `I-EMIT-ESCAPE`. L0 / L1 **MUST** enforce this in the sampler hook via logit mask before sampling; L2 detects violations post-hoc in the token stream hook and routes through `kind=protocol_violation` (invariant=`I-STRICT-ENVELOPE-ONLY`) the same way as §6.5.1 item 10, returning `E_PROTOCOL_VIOLATION`. When `raw_text_outside_envelope="audit-only"`, the invariant is **not** enforced, but the kernel **MUST** emit audit `kind=raw_text_outside_envelope` (which does not constitute a violation). When `raw_text_outside_envelope="allowed"` or `strict_protocol_mode=false`, the invariant is **not** active, preserving the existing compatibility behavior.
 
 ## 4.5 Role Semantics
 
@@ -432,6 +436,7 @@ For the three envelope kinds **`execute` / `output` / `edit`**, "**who initiated
 **The `rollback` envelope is the exception**: `<lmsc_rollback>` **carries no attributes** (§4.2) and does not use the `from` mechanism; its role is determined implicitly by the generation path. When generated by model autoregression it is equivalent to `from="model"`; when a program explicitly calls A3 `token_rollback`, the audit records `source=program:<name>`. **The model path being "equivalent to `from=\"model\"`" is only semantic attribution that treats it as model-initiated; no actual `from` attribute exists**. Any code parsing a rollback envelope **MUST NOT** try to read or infer its `from` field: that field does not exist and is structurally absent. Rollback-related audit **MUST NOT** use an `envelope_from` field; source attribution uses §14.2 `rollback_origin` or `AuditRecord.source`.
 
 ---
+
 
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
@@ -567,6 +572,7 @@ Position := BeforeNextSample | AtEnvelopeClose
 ### A5 - `session_fork`
 
 ```
+session.current_handle() -> SessionHandle # current session handle; does not create a fork
 session.fork() -> SessionHandle # new session, shared KV prefix
 session.restore(handle: SessionHandle) -> Result<()> # switch to an already forked session
 session.drop_fork(handle: SessionHandle)-> Result<()> # release a fork
@@ -574,6 +580,7 @@ session.drop_fork(handle: SessionHandle)-> Result<()> # release a fork
 
 - **Preconditions**:
   - The implementation level **MUST** be **L0** (A5 is unavailable under L1 / L2; calls return `E_ATOMIC_UNSUPPORTED`);
+  - `current_handle`: the caller holds the `session.fork` cap; returns the `SessionHandle` for the current session, does not create a new fork, does not allocate a CoW snapshot, and does not count against fork depth / concurrency / memory quotas;
   - `fork`: **handlers in the session **MUST NOT** hold an in-progress streaming `envelope.emit`**; if this condition is violated, the kernel **MUST** return `E_EMIT_STREAM_OPEN`, with details containing at least `open_stream_count`, and **SHOULD** contain the list of unclosed `envelope_id` values that can be exposed; calling inside dispatch is legal: `runtime admin fork` (§12.3) depends on this path. (Cannot fork while streaming emit is unfinished.)
   - **Fork quota checks** (formally linked to Appendix F.3 normative constants and the errors registered in §15.2) - before allocating a CoW KV snapshot, the kernel **MUST** perform the following three checks, returning errors in this order. In concurrent scenarios, crossing through the gap between assignment and allocation **MUST** be guarded (quota check + CoW allocation **MUST** hold a mutex or equivalent semantics for the same root session):
     1. **Depth**: if the fork-chain depth from the root session downward is ≥ `SESSION_FORK_MAX_DEPTH` (Appendix F.3; default 8), return `E_FORK_DEPTH_EXCEEDED`, audit details `reason="depth_limit"`;
@@ -581,12 +588,13 @@ session.drop_fork(handle: SessionHandle)-> Result<()> # release a fork
     3. **Memory quota**: if the implementation sets `SESSION_FORK_MEM_LIMIT_MB` (Appendix F.3; default 1024, `null` means disabled), and **the estimate for this fork + accumulated CoW memory of currently active forks** exceeds that value, return `E_FORK_MEM_EXCEEDED` (quota exceeded); if depth / concurrency both pass and quota is sufficient (or disabled) but the underlying CoW allocation fails (physical OOM / address-space exhaustion), return `E_FORK_OOM` (physical allocation failure). The two are explicitly distinct.
   - `restore` / `drop_fork`: the handle is valid.
 - **Postconditions**:
+  - `current_handle` returns the opaque handle of the current session; it does not change context / KV / audit cursor / dispatcher frame / fork quota state;
   - `fork` saves the complete context + KV cache (CoW reference) + kernel metadata (program table, kv refcount, capability set, audit cursor); returns a new SessionHandle, while the original session remains alive;
   - `restore` switches current execution to the target session, while the original session remains alive (the caller can explicitly release it with `drop_fork`);
   - `drop_fork` releases the corresponding CoW reference.
 - **Errors**: `E_FORK_INVALID` / `E_EMIT_STREAM_OPEN` / `E_FORK_OOM` / `E_FORK_DEPTH_EXCEEDED` / `E_FORK_MEM_EXCEEDED` (trigger conditions are described in the precondition quota checks above; retryable classification is in §15.3).
 - **Notes**: explicitly uses **fork semantics**. Supports tree-of-thought, OOM protection, and transactional dispatch.
-- **`SessionHandle` type** - `SessionHandle` is an in-memory handle (opaque type); it is **not** serializable and **MUST NOT** be persisted across sessions; it is valid only during the current kernel instance lifecycle. Carrying the handle across processes / deployments **MUST** return `E_FORK_INVALID`.
+- **`SessionHandle` type** - `SessionHandle` is an in-memory handle (opaque type); it is **not** serializable and **MUST NOT** be persisted across sessions; it is valid only during the current kernel instance lifecycle. `current_handle()` and `fork()` return the same kind of handle; a program can save the parent session handle before `restore(child)` and later use `restore(parent)` to return to the parent branch. Carrying the handle across processes / deployments **MUST** return `E_FORK_INVALID`.
 
 ## 5.3 B - Envelope Structure
 
@@ -874,7 +882,7 @@ ref.kinds_registered() -> Vec<string>
  **Explicitly disabled set** - Network / file / sandbox I/O (`net.*` / `fs.*` / `exec.sandbox`); scheduling and yielding classes (`scheduler.suspend` / `scheduler.resume` / `scheduler.preempt` / `scheduler.frame_push` / `scheduler.frame_pop`); classes that produce new envelopes (any `envelope.emit`, `tokens.inject`, `token_rollback`); cross-session access (KV / blob / region of other sessions / fork branches); direct reads of kernel-internal structures; direct `region.body` reads and `region.edit` writes; the previously mentioned "read-only query for `region.tag`" item, if region metadata is needed, **SHOULD** be prefetched into KV during a prior dispatch cycle; any operation that might wait on an external condition or hold a long lock (including distribution-defined equivalent syscalls). **Violating calls**: the kernel **MUST** return `E_CAP_DENIED` or `E_PROTOCOL_VIOLATION` and emit `kind=protocol_violation` audit (details contain `context="resolve_ref_forbidden_syscall"`), and **MUST NOT** merely log and allow the call.
 
  **Idempotence and caching** - Within the same turn, `ref.resolve` for the same `(kind, id)` **SHOULD** be idempotent; the kernel **MAY** cache resolver return values at turn granularity; the cache is automatically invalidated at the turn boundary; `E_REF_EXPIRED` results **MUST NOT** be cached. **New resolves after fork are independent in each session** (consistent with the CoW semantics above); `restore / drop_fork` operations only clean up turn-local caches produced by the corresponding side itself. Idempotence is not required across turns. External data **MUST** be prefetched by the program in a prior dispatch / suspend / resume cycle and stored with `blob.put` / `kv.put`; `resolve_ref` only performs table lookup and return. Violation will block the inference stack (non-normative consequence) and **MAY** trigger implementation-defined inference stack timeout protection (this is an implementation freedom, not a kernel error code).
-- **Errors**: `E_REF_KIND_TAKEN` / `E_REF_NOT_FOUND` / `E_REF_EXPIRED`.
+- **Errors**: `E_REF_KIND_TAKEN` / `E_REF_NOT_FOUND` / `E_REF_EXPIRED` / `E_REF_BODY_INVALID` / `E_PROTOCOL_VIOLATION` / `E_CAP_DENIED`.
 
 ### F4 - `region`
 
@@ -964,6 +972,7 @@ clock.cancel(id) -> Result<()>
 - **Errors**: `E_CLOCK_BAD_DURATION`.
 
 ---
+
 
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
@@ -1066,7 +1075,7 @@ An L2 implementation has no sampler hook. The following **nine protocol invarian
 7. `I-ATTR-CLEAN` (L2 detection point: scan kernel-owned attribute headers for any reserved token literal sequence, and verify that the separator before the first attribute and the blank-line terminator are legal);
 8. `I-ROLLBACK-NO-ATTR` - when observing a `<lmsc_rollback>` open, kernel-owned attribute headers or attribute metadata **MUST NOT** appear; any non-empty value is a violation and returns `E_ROLLBACK_PATTERN_INVALID`;
 9. `I-REF-CHARSET` (L2 detection point: scan body bytes and the micro-grammar at `</lmsc_ref>` close).
-10. `I-STRICT-ENVELOPE-ONLY` (**conditional**, included only when `features.strict_protocol_mode=true` and `features.raw_text_outside_envelope="forbidden"`; L2 detection point: at every token-on-stream check, if the envelope stack depth = 0 and the token is not one of `<lmsc_execute>` / `<lmsc_output>` / `<lmsc_edit>` / `<lmsc_rollback>` / `<|lmsc_suspend|>` / `<lmsc_ref>` open / EOS, it is a violation; returns `E_PROTOCOL_VIOLATION`).
+10. `I-STRICT-ENVELOPE-ONLY` (**conditional**, included only when `features.strict_protocol_mode=true` and `features.raw_text_outside_envelope="forbidden"`; L2 detection point: at every token-on-stream check, if the envelope stack depth = 0 and the token is not one of `<lmsc_execute>` / `<lmsc_output>` / `<lmsc_edit>` / `<lmsc_rollback>` / `<|lmsc_suspend|>` / `<lmsc_ref>` open / EOS, it is a violation; returns `E_PROTOCOL_VIOLATION`). If that entry is a top-level `<lmsc_ref>`, a successful expansion must also follow the strict top-level ref materialization rule in §9.3; placing ordinary resolved bytes directly into context outside an envelope is the same invariant violation.
 
 The first eight correspond to the complete §4.4 A1 group; the ninth corresponds to `I-REF-CHARSET` in the §4.4 "post-hoc recognition + abort" group; the 10th is the conditional invariant introduced in §4.4 / §10.1.2 -- when its activation condition is not met, the item does not exist and RC3 behavior is unaffected. `I-REF-ANY` (a ref element **MAY** appear in any envelope body) and `I-EMIT-ESCAPE` (enforced at syscall entry) are not in this list: the former has no violation form, and the latter is covered by syscall-entry checks.
 
@@ -1151,6 +1160,7 @@ L0 / L1 implementations **MUST** be `native`; only L2 **MAY** declare `buffered`
 
 ---
 
+
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
 > Protocol revision: `draft v1`.
@@ -1188,7 +1198,7 @@ ctx.clock # I1
 | `tokens.is_special` / `name_of` / `id_of` | A2 | -- |
 | `tokens.rollback` | A3 | `tokens.rollback.explicit`† (unreachable from the V1 program side; retained only as a kernel-internal equivalent path and future extension entry point); the model rollback envelope path goes through kernel internals |
 | `tokens.inject` | A4 | `tokens.inject`* + `tokens.inject.special`† (when reserved tokens are included) |
-| `session.fork` / `restore` / `drop_fork` | A5 | `session.fork`* |
+| `session.current_handle` / `fork` / `restore` / `drop_fork` | A5 | `session.fork`* |
 | `envelope.emit` | B3 | `envelope.emit` |
 | `scheduler.suspend` / `resume` | C1 / C2 | `scheduler.suspend` |
 | `scheduler.abort` | C3 | `scheduler.abort.own` or `scheduler.abort.any`† |
@@ -1259,6 +1269,7 @@ syscalls:
 > **`Stream<Bytes>` ABI under sandbox** - The ABI for `Stream<Bytes>` on sandbox backends (WASM / Lua, etc.) is distribution-defined and is not a normative constraint; the recommended design is a pull callback + backpressure mechanism, with binding documentation that clearly maps `chunk_max_tokens` / backpressure windows and timeout strategy to `E_EMIT_STREAM_BACKPRESSURE_TIMEOUT`.
 
 ---
+
 
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
@@ -1433,6 +1444,7 @@ When a handler panics, dispatch times out, C3 aborts, dispatch ends normally, or
 
 ---
 
+
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
 > Protocol revision: `draft v1`.
@@ -1462,6 +1474,8 @@ Like other attribute values, `gen` is constrained by `ATTR_VALUE_MAX_BYTES`; whe
 ## 9.3 Ref Resolution Chain
 
 > **Ref expansion semantics** - The result of `ref.resolve` replaces the original `<lmsc_ref>...</lmsc_ref>` interval by **inline substitution in the token stream**; this path does not create a program-visible `RegionId`, does not use the cap / lock / persist rules of user-space `region.edit`, and does not emit `region_edit` audit. The expanded tokens enter context, and the original `<lmsc_ref>` open / close reserved tokens are **no longer retained** in context, to avoid triggering infinite-loop resolution. The content pending injection before expansion **MUST** pass through `I-EMIT-ESCAPE`.
+
+> **Strict top-level ref materialization** - When `features.strict_protocol_mode=true` and `features.raw_text_outside_envelope="forbidden"`, and the `<lmsc_ref>` open appears at envelope stack depth = 0 in `GENERATING`, ordinary inline bytes returned by a successful `ref.resolve` **MUST NOT** be written directly into context outside an envelope merely after `I-EMIT-ESCAPE`. The kernel **MUST** do one of the following: (1) materialize the resolved content as a complete kernel-generated `<lmsc_output>` system envelope (or a distribution-declared equivalent envelope-safe structure), with an attribute header containing at least `from="system"` and `schema="ref_resolve_result"`, and with the body still processed by `I-EMIT-ESCAPE`; or (2) reject the expansion, emit audit `kind=protocol_violation` (`invariant="I-STRICT-ENVELOPE-ONLY"`, `context="ref_expand_strict_top_level"`), and present a system error envelope to the model through the ref-resolution failure path below. This system envelope, like a ref failure error envelope, is directly injected by the kernel and does not trigger the self-output-edit observer. If a distribution wants to let a resolver return a typed protocol item rather than ordinary bytes, it **MUST** separately declare the deterministic parser, escaping, audit, and conformance behavior; the default ordinary inline-bytes path in this specification does not provide that capability.
 
 ```plantuml
 @startuml
@@ -1497,7 +1511,7 @@ That system error envelope is directly injected by the kernel and is **not** par
 
 ## 9.4 Fork
 
-A5 fork semantics apply only to implementations whose `runtime info.kernel.atomics` includes A5. L1 / L2 implementations **MUST NOT** expose usable `session.fork` / `session.restore` / `session.drop_fork` semantics; if a program calls these entries, the kernel **MUST** return `E_ATOMIC_UNSUPPORTED`. The following clauses in this section define the complete semantics that implementations supporting A5 **MUST** satisfy.
+A5 fork semantics apply only to implementations whose `runtime info.kernel.atomics` includes A5. L1 / L2 implementations **MUST NOT** expose usable `session.current_handle` / `session.fork` / `session.restore` / `session.drop_fork` semantics; if a program calls these entries, the kernel **MUST** return `E_ATOMIC_UNSUPPORTED`. The following clauses in this section define the complete semantics that implementations supporting A5 **MUST** satisfy.
 
 A5 fork applies to **the entire session state** (the following list is the normative complete snapshot set; fork **MUST** atomically save all of the following entries):
 
@@ -1516,7 +1530,7 @@ A5 fork applies to **the entire session state** (the following list is the norma
 - **active Stream generator** (prohibited by the A5 precondition before fork): this restates consistency -- when a handler holds an unclosed streaming `envelope.emit`, it **MUST NOT** fork; there is no active Stream generator that needs to be copied with the session at fork time.
 - **handler-internal mutable state**: the fork snapshot does not include process-global variables, heap objects, connection pools, or other external mutable state inside native / host handlers. If such state is session-related, the handler **MUST** isolate it by `session_id` / fork branch, or store it in kernel-managed state (KV / blob / ref / region) before it participates in fork semantics. The kernel **MUST NOT** imply that such external state is automatically CoW-forked by A5.
 
-`fork()` returns a new `SessionHandle`, and the original session remains alive. `restore(handle)` switches into the target session, and the original session remains alive until `drop_fork`. This supports tree-of-thought, OOM protection, and transactional dispatch.
+`current_handle()` returns the `SessionHandle` of the current session without creating a fork, allocating a CoW snapshot, or counting against fork quotas. `fork()` returns a new `SessionHandle`, and the original session remains alive. `restore(handle)` switches into the target session, and the original session remains alive until `drop_fork`. A program that needs to move back and forth between parent and child branches **MUST** save the parent handle with `current_handle()` before switching into the child; it can later use `restore(parent_handle)` to return to the parent branch. This supports tree-of-thought, OOM protection, and transactional dispatch.
 
 > **Note** - A5 fork semantics are defined by §5.2 and §9.4: they apply to the entire session state and remain consistent throughout the document, without ambiguity.
 
@@ -1555,6 +1569,7 @@ A5 fork applies to **the entire session state** (the following list is the norma
 - An implementation **MAY** reject `restore` for a fork generated by a different kernel build id; when rejected, it returns `E_FORK_INVALID` and records the source build / current build in audit. This is a conformance-permitted behavior, not a requirement.
 
 ---
+
 
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
@@ -1668,7 +1683,7 @@ When **strict protocol mode** (`features.strict_protocol_mode=true`) is enabled,
 | `audit-only` | Allowed to pass, but each contiguous span of raw text outside an envelope emits one audit `kind=raw_text_outside_envelope` | Recorded as audit by the token stream hook; does not constitute a violation |
 | `forbidden` | Outside envelopes, only the "legal LMSC protocol entry set" is allowed: the four envelope opens (`<lmsc_execute>` / `<lmsc_output>` / `<lmsc_edit>` / `<lmsc_rollback>`), `<|lmsc_suspend|>`, `<lmsc_ref>` open, and EOS | Activates `I-STRICT-ENVELOPE-ONLY` (§4.4): L0 / L1 **MUST** enforce in the sampler hook via logit mask; L2 routes through the `protocol_violation` path equivalent to §6.5.1 after post-hoc detection in the token stream hook, returning `E_PROTOCOL_VIOLATION` |
 
-> `<|lmsc_abort|>` is excluded from the legal entry set outside envelopes due to `I-ABORT-SCOPED`; this means under strict + `forbidden` mode the model **CANNOT** "abort everything" mid-turn, and **MUST** rely on EOS or external abort instead. `<lmsc_ref>` open **MAY** appear in any envelope body and in ordinary chunks under §4.4 `I-REF-ANY`; under strict + `forbidden` mode `<lmsc_ref>` open at envelope stack depth = 0 **MUST** be treated as a legal entry (with the same standing as envelope opens) to avoid conflicting with `I-REF-ANY` -- i.e., the entry set under that mode is: the four envelope opens, `<|lmsc_suspend|>`, `<lmsc_ref>` open, and EOS.
+> `<|lmsc_abort|>` is excluded from the legal entry set outside envelopes due to `I-ABORT-SCOPED`; this means under strict + `forbidden` mode the model **CANNOT** "abort everything" mid-turn, and **MUST** rely on EOS or external abort instead. `<lmsc_ref>` open **MAY** appear in any envelope body and in ordinary chunks under §4.4 `I-REF-ANY`; under strict + `forbidden` mode `<lmsc_ref>` open at envelope stack depth = 0 **MUST** be treated as a legal entry (with the same standing as envelope opens) to avoid conflicting with `I-REF-ANY` -- i.e., the entry set under that mode is: the four envelope opens, `<|lmsc_suspend|>`, `<lmsc_ref>` open, and EOS. A successful expansion of that ref is still subject to the strict top-level ref materialization rule in §9.3; ordinary bytes returned by the resolver **MUST NOT** become raw text outside an envelope.
 
 > **Boundary of "contiguous span" under `audit-only`** - A span of raw text outside an envelope starts at the turn start or right after the previous reserved-token boundary, and ends at the first occurrence of any of: the next reserved token (any envelope open / control single token / `<lmsc_ref>` open), EOS, or IDLE. If the span byte length exceeds the byte budget corresponding to `CHUNK_MAX_TOKENS`, the kernel **MUST** emit `kind=raw_text_outside_envelope` audits (§14.2) sliced at `CHUNK_MAX_TOKENS` granularity; within the same turn, the same byte range **MUST NOT** be re-emitted.
 
@@ -1715,6 +1730,7 @@ Turn = the interval from leaving IDLE to the next time IDLE is reached. Per-turn
 - Async events (timers, external resume) are queued to the event queue; the kernel handles them at IDLE or explicit resume points.
 
 ---
+
 
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
@@ -1811,6 +1827,7 @@ Boot and `runtime info` validation **MUST** satisfy: fixed-only capabilities **M
 > **External decider SHOULD**: the external decider **SHOULD** be declared by the distribution in the `capabilities.requestable` configuration, and the grant/resume **SHOULD** be completed through the `capability` program or an equivalent host interface; the distribution **SHOULD** document the decider identity and trigger conditions so program developers can anticipate request behavior.
 
 ---
+
 
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
@@ -1999,6 +2016,7 @@ Otherwise, it is non-conforming.
 
 ---
 
+
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
 > Protocol revision: `draft v1`.
@@ -2174,6 +2192,7 @@ Over limit **MUST** be rejected; if the subsystem has defined a dedicated error 
 
 ---
 
+
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
 > Protocol revision: `draft v1`.
@@ -2297,6 +2316,7 @@ Differences between raw export and model-visible projection **MUST** be explicit
 `runtime audit tail` / `search` return a **projection** - the kernel **MUST** return only `scope=model-visible` and redact host privacy.
 
 ---
+
 
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
@@ -2475,6 +2495,7 @@ Every error code **MUST** define whether it is retryable in the distribution err
 
 ---
 
+
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
 > Protocol revision: `draft v1`.
@@ -2518,10 +2539,12 @@ Implementations claiming "LMSC conforming" **MUST**:
 - **C-21** - `rollback` / `rollback_error` audit details **MUST** use `search_scope` for the rollback search range and **MUST NOT** emit `details.scope` in new audit records; top-level `AuditRecord.scope` represents audit visibility only. The storm-limit locked path for `rollback_error` details **MUST** include `storm_locked=true`.
 - **C-22** - Kernel-owned attribute headers, `envelope.emit` attrs, and region attrs that will be materialized as attribute headers **MUST** enforce the `ATTR_VALUE_MAX_BYTES` cap; if any attribute value exceeds the cap or contains a reserved-token literal, the relevant syscall / injection path **MUST** return `E_EMIT_ESCAPE_VIOLATION` or an equivalent binding-layer error and **MUST NOT** silently truncate. `gen` remains a per-program free string, and the kernel **MUST NOT** compare it across programs.
 - **C-23** - `features.envelope_chunk_observation="self-output-edit"` covers only output/edit chunks produced by the emitting handler itself through `envelope.emit(kind=output|edit)`; kernel-generated system error envelopes (including `ref.resolve` failure errors) **MUST NOT** trigger that observer.
-- **C-N1** - When `features.strict_protocol_mode=true` and `features.raw_text_outside_envelope="forbidden"` (§10.1.2), L0 / L1 implementations **MUST** enforce §4.4 `I-STRICT-ENVELOPE-ONLY` via logit mask in the sampler hook: at `GENERATING` with envelope stack depth = 0, all tokens other than `<lmsc_execute>` / `<lmsc_output>` / `<lmsc_edit>` / `<lmsc_rollback>` / `<|lmsc_suspend|>` / `<lmsc_ref>` open / EOS **MUST** be masked out (`<lmsc_ref>` open is included to stay consistent with `I-REF-ANY` -- a ref **MAY** appear in any envelope body and in ordinary chunks); L2 implementations follow item 10 of §6.5.1 to detect post-hoc and emit `kind=protocol_violation` (`invariant=I-STRICT-ENVELOPE-ONLY`). Both levels **MUST NOT** downgrade this constraint to "post-hoc discard" or "single-token truncation".
+- **C-24** - An implementation that declares A5 support **MUST** provide `session.current_handle()`, and it uses the same `session.fork` cap as `session.fork()`. `current_handle()` **MUST NOT** create a fork, allocate a CoW snapshot, change context / KV / audit cursor / dispatcher frame, or count against fork depth / concurrency / memory quotas; the returned handle **MUST** be usable by a later `session.restore(handle)` to return to the current branch. L1 / L2 implementations **MUST** return `E_ATOMIC_UNSUPPORTED` for this entry.
+- **C-N1** - When `features.strict_protocol_mode=true` and `features.raw_text_outside_envelope="forbidden"` (§10.1.2), L0 / L1 implementations **MUST** enforce §4.4 `I-STRICT-ENVELOPE-ONLY` via logit mask in the sampler hook: at `GENERATING` with envelope stack depth = 0, all tokens other than `<lmsc_execute>` / `<lmsc_output>` / `<lmsc_edit>` / `<lmsc_rollback>` / `<|lmsc_suspend|>` / `<lmsc_ref>` open / EOS **MUST** be masked out (`<lmsc_ref>` open is included to stay consistent with `I-REF-ANY` -- a ref **MAY** appear in any envelope body and in ordinary chunks); L2 implementations follow item 10 of §6.5.1 to detect post-hoc and emit `kind=protocol_violation` (`invariant=I-STRICT-ENVELOPE-ONLY`). A successful expansion of a top-level ref must also satisfy the §9.3 strict top-level ref materialization rule. Both levels **MUST NOT** downgrade this constraint to "post-hoc discard" or "single-token truncation".
 - **C-N2** - When `features.raw_text_outside_envelope="audit-only"` (§10.1.2), each contiguous span of raw text observed at envelope stack depth = 0 **MUST** cause the kernel to emit a `kind=raw_text_outside_envelope` audit (§14.2; schema therein), and the kernel **MUST NOT** return `E_PROTOCOL_VIOLATION` and **MUST NOT** trigger abort. `audit-only` and `forbidden` are mutually exclusive; within the same turn the same span **MUST NOT** simultaneously emit `protocol_violation` and `raw_text_outside_envelope`.
 - **C-N3** - When `features.auto_execute_scaffold=true` (§10.1.2), the kernel-owned attribute header that immediately follows the kernel-injected `<lmsc_execute>` open **MUST** contain `id` and `from="model"`, and **MUST NOT** contain a `program` field; the dispatch target **MUST** still be parsed from the first word of the body after `</lmsc_execute>` close. Any implementation that pre-fills `program` into the scaffold attribute header and skips body-first-word routing on that basis is **non-conforming**.
 - **C-N4** - Scaffold injection **MUST** occur only at `GENERATING` with envelope stack depth = 0; in any other state (`IN_ENVELOPE`, `DISPATCHING`, `SUSPENDED`, `INIT`, or `IDLE` before it has been left) the scaffold **MUST NOT** be triggered. The scaffold injection path **MUST** emit a `kind=envelope_open` audit with `details.open_source="kernel:scaffold"` and `details.envelope_from="model"`; this path **MUST NOT** be charged against `INJECT_MAX_TOKENS`, and sharing the same counter with the program-side A4 `token_inject` is **non-conforming**.
+- **C-N5** - Under strict + `raw_text_outside_envelope="forbidden"`, a successful expansion of `<lmsc_ref>` at envelope stack depth 0 **MUST NOT** write ordinary inline bytes returned by the resolver directly into context outside an envelope. The kernel **MUST** materialize the content as a complete system envelope / equivalent envelope-safe structure per §9.3, or reject the expansion and emit `protocol_violation` (`invariant="I-STRICT-ENVELOPE-ONLY"`, `context="ref_expand_strict_top_level"`).
 
 ### 16.1.1 Minimum Conformance Test Matrix
 
@@ -2573,6 +2596,7 @@ Implementations claiming "LMSC conforming" **MUST**:
 - Producing unregistered `E_ROLLBACK_BOUNDARY`, instead of expressing out-of-bounds with `rollback(outcome=pattern_out_of_bound)` or the program path's `E_ROLLBACK_PATTERN_NOT_FOUND` + `details.outcome=pattern_out_of_bound`.
 
 ---
+
 
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
@@ -2654,6 +2678,7 @@ This appendix expands every primitive in the §7.2 syscall table into method-lev
 | `tokens.id_of(name)` | A2 | -- | Same as above |
 | `tokens.rollback(pattern, scope)` | A3 | `tokens.rollback.explicit`† | V1 program side unreachable; model path uses kernel internals |
 | `tokens.inject(tokens, position)` | A4 | `tokens.inject`* (+`tokens.inject.special`† if reserved tokens are included) | ordinary calls while SUSPENDED return `E_INJECT_BAD_POSITION`; stack overflow returns `E_STACK_OVERFLOW` |
+| `session.current_handle()` | A5 | `session.fork`* | Unavailable under L1; does not create a fork |
 | `session.fork()` | A5 | `session.fork`* | Unavailable under L1 |
 | `session.restore(handle)` | A5 | `session.fork`* | |
 | `session.drop_fork(handle)` | A5 | `session.fork`* | |
