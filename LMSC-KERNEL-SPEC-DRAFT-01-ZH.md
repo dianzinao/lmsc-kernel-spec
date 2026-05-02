@@ -409,7 +409,7 @@ key_token = "<|key_" , ident , "|>" ;
 - **I-ROLLBACK-BOUND** · `<lmsc_rollback>` 的匹配搜索**禁止** 跨越已关闭 envelope 的边界、boot output 的边界、或已声明 `rollback_safe: false` 的 dispatch 的边界。
 - **I-ROLLBACK-NO-NEST**· `<lmsc_rollback>` 的 body 内**禁止** 出现任何保留 token（任何 envelope open/close、`<|lmsc_abort|>` / `<|lmsc_suspend|>`、`<lmsc_ref>` / `</lmsc_ref>`、key token）。kernel **必须** 通过 logit mask 强制；事后路径识别到违反**必须** emit `kind=protocol_violation` 并返 `E_ROLLBACK_PATTERN_INVALID`。
 
-- **I-ROLLBACK-NO-ATTR**· `<lmsc_rollback>` **禁止**携带任何属性头或属性 metadata；L0 / L1 以 logit mask 强制，L2 下作为 §6.5.1 事后检测清单第 9 条。触发 violation 时返 `E_ROLLBACK_PATTERN_INVALID` 并 emit `protocol_violation` audit。
+- **I-ROLLBACK-NO-ATTR**· `<lmsc_rollback>` **禁止**携带任何属性头或属性 metadata；L0 / L1 以 logit mask 强制，L2 下由 §6.5.1 的同名事后检测项处理。触发 violation 时返 `E_ROLLBACK_PATTERN_INVALID` 并 emit `protocol_violation` audit。
 
  > **L0 / L1 的 lookahead 算法要求**· kernel **必须**对所有保留 token 的**字面字节序列**构建字节级 Aho-Corasick 或等价 trie，用于 logit mask 的 multi-pattern lookahead：候选 token 被追加后，当前 rollback body 已累积字节序列的**任一后缀**若构成任一保留 token 字面的非空前缀，kernel **必须** `hard_deny` 该候选 token。本要求涵盖 envelope open/close 四对、`<|lmsc_abort|>` / `<|lmsc_suspend|>`、`<lmsc_ref>` / `</lmsc_ref>`、全部 `<|key_*|>` 字面的全集。L2 不适用该 lookahead；改由 §6.5.1 第 5 条事后核查承担。
 - **I-ABORT-SCOPED** · `<|lmsc_abort|>` **仅** 在 envelope 内有效。envelope 外出现时 kernel **必须** 丢弃（优先通过 logit mask 屏蔽）。
@@ -422,7 +422,7 @@ key_token = "<|key_" , ident , "|>" ;
 
 **`execute` / `output` / `edit` 三种 envelope** 的"**由谁发起**"完全由属性头中的 `from` 属性决定（§4.2）。kernel **禁止** 根据 envelope 种类硬编码 role——`<lmsc_execute>` 默认 `from="model"`，但程序代写带 `from="program:flow"` 的 kernel-owned 属性头是合法的。
 
-**`rollback` envelope 例外**：`<lmsc_rollback>` **不携带任何属性**（§4.2），也不走 `from` 机制；它的 role 由生成路径隐式决定——模型自回归生成时等价 `from="model"`，程序显式调用 A3 `token_rollback` 时 audit 记录 `source=program:<name>`。**模型路径"等价 `from=\"model\"`"仅在语义归因上视为模型发起，不存在实际 `from` 属性**；任何解析 rollback envelope 的代码**禁止**尝试读取或推断其 `from` 字段——该字段不存在且在结构上被**禁止**。
+**`rollback` envelope 例外**：`<lmsc_rollback>` **不携带任何属性**（§4.2），也不走 `from` 机制；它的 role 由生成路径隐式决定——模型自回归生成时等价 `from="model"`，程序显式调用 A3 `token_rollback` 时 audit 记录 `source=program:<name>`。**模型路径"等价 `from=\"model\"`"仅在语义归因上视为模型发起，不存在实际 `from` 属性**；任何解析 rollback envelope 的代码**禁止**尝试读取或推断其 `from` 字段——该字段不存在且在结构上被**禁止**。rollback 相关 audit **禁止**使用 `envelope_from` 字段；来源归因使用 §14.2 的 `rollback_origin` 或 `AuditRecord.source`。
 
 ---
 > LMSC Kernel Specification draft v1
@@ -546,9 +546,13 @@ Position := BeforeNextSample | AtEnvelopeClose
  - 所有 tokens 在词表内；
  - 若包含保留 token，持 `tokens.inject.special` cap（fixed-only）；
  - 总长度 ≤ `INJECT_MAX_TOKENS`（默认 4096）；
- - 在 envelope 外**禁止**注入 envelope close token。
+ - 在 envelope 外**禁止**注入 envelope close token；
+ - `position=AtEnvelopeClose` **必须**仅在当前 envelope 栈非空且栈顶不是 rollback envelope 时使用；否则 kernel **必须**返回 `E_INJECT_BAD_POSITION`。
+- **Position 语义**：
+ - `BeforeNextSample`：在下一次模型采样前插入，插入点由当前状态机自然位置决定；
+ - `AtEnvelopeClose`：在当前最内层 open envelope 的匹配 close token **之前**插入，使注入 tokens 成为该 envelope body 的一部分。该位置**禁止**用于 rollback envelope body，以免程序注入破坏 rollback pattern 的 `I-ROLLBACK-NO-NEST` / `I-ROLLBACK-BOUND` 判定。
 - **后置**：插入并更新 KV cache；发 audit。
-- **错误**：`E_INJECT_BAD_TOKEN` / `E_INJECT_CAP_DENIED` / `E_INJECT_TOO_LARGE`。
+- **错误**：`E_INJECT_BAD_TOKEN` / `E_INJECT_BAD_POSITION` / `E_INJECT_CAP_DENIED` / `E_INJECT_TOO_LARGE`。
 
 ### A5 · `session_fork`
 
@@ -795,7 +799,7 @@ program.unregister(id) -> Result<()>
 - **`on_load` 失败回滚**· `on_load` 返 `Err` / panic 时，kernel **必须**自动 `unregister` 该程序（清理已入表的元数据与命名空间）并 emit audit `kind=program_register_failed`（details 含错误摘要与 `reason`）；`register` 对调用者返错。**`on_load` 失败的清理路径不调用 `on_unload`**——程序尚未完成初始化，`on_unload` 所依赖的状态可能不一致，调用不安全。kernel 只保证元数据回滚，不保证 `on_load` 期间已发生的 `kv.put` / `blob.put` 等副作用事务回滚；程序需自行保证幂等清理。
 - **错误**：`E_PROG_DUP_NAME` / `E_PROG_UNKNOWN_CAP` / `E_PROG_REF_KIND_TAKEN` / `E_PROG_MANIFEST_INVALID` / `E_PROG_PROTECTED` / `E_PROG_IN_USE`。
 - **备注**：程序表操作统一收敛为"一条程序表原语的五个操作"，与 kv/blob 等原语族保持一致。
-- **模型可见的程序表更新**：`program.register` / `program.unregister` 成功后，kernel **应**在下一次模型 dispatch 前将更新后的程序表摘要注入为 context（通过 `runtime info` 更新或 `<lmsc_output>` 系统消息），使模型感知最新可用程序集合；具体注入时机和格式为发行版自由度，但**禁止**在同一 dispatch 周期内静默使用已变更的程序表而不通知模型。
+- **模型可见的程序表更新**：`program.register` / `program.unregister` 成功后，kernel **应**在下一次模型 dispatch 前将更新后的程序表摘要注入为 context（通过 `runtime info` 更新或 `<lmsc_output>` 系统消息），使模型感知最新可用程序集合；具体注入时机和格式为发行版自由度，但**禁止**在同一 dispatch 周期内静默使用已变更的程序表而不通知模型。若发行版选择通过 `<lmsc_output>` 注入摘要，attribute header **应**至少包含 `from="system"`、`schema="program_table_summary"`、`visibility="all"`，body **应**包含程序名、可见 action / capability 摘要和版本号；若发行版选择仅通过 `runtime info` 更新，也**应**在下一次模型 dispatch 前保证模型可见 context 中存在可发现的 `runtime info` 刷新点。
 - **可见性过滤**：`program.list` 返回调用方可见程序集合；`program.lookup(name)` 对不可见程序**必须**返回 `None`，与不存在同形；`program.info(id)` 对不可见程序**必须**返回 `None` 或仅含发行版明确标为可公开的脱敏摘要。持 `program.admin` 的调用方可获得完整视图。该策略与 §8.6、附录 D 保持一致。
 
 ## 5.7 F · 状态
@@ -1103,10 +1107,12 @@ L2 token stream hook 对 **kernel-owned attribute header 的正文部分**运行
 S_OPEN → (观察任一字节) → S_ATTR
 S_ATTR → (在累计字节序列中出现任一保留字面前缀：
  `<lmsc_` / `</lmsc_` / `<|lmsc_` / `<|key_`) → VIOLATION
+S_ATTR → (首属性前分隔符、属性行语法、line_end 或空行终止符不符合 §4.3) → VIOLATION_ATTR_FORMAT
+S_ATTR → (超过 attribute header 长度预算仍未出现终止空行) → VIOLATION_ATTR_FORMAT
 S_ATTR → (连续两个 line_end，属性头空行结束) → S_BODY
 ```
 
-规模以 AC trie 或每字节即检查的字面前缀集即可。触发 VIOLATION 时kernel **必须** abort **当前 turn**（而非仅 abort 当前 envelope，与其他不变量违规处理统一）。
+规模以 AC trie 或每字节即检查的字面前缀集即可。`VIOLATION_ATTR_FORMAT` 与保留字面 `VIOLATION` 同属 `I-ATTR-CLEAN` 违规：kernel **必须** emit `kind=protocol_violation`（invariant=`I-ATTR-CLEAN`，details 含 `reason="attr_format_invalid"` 或等价原因）并 abort **当前 turn**（而非仅 abort 当前 envelope，与其他不变量违规处理统一）。
 
 ### 6.5.2 L2 下 `envelope.emit` 流式降级
 
@@ -1375,7 +1381,7 @@ ChunkDecision := Continue | DetachObserver | AbortEnvelope
 | `preempt` | `scheduler.preempt` | `scheduler.preempt`，execute 注入另需 `scheduler.preempt.execute` | 使用 C4 的程序**必须**声明 |
 | `register_ref_resolver` | `ref.bind` | `program.ref.bind` | manifest 的 `ref_kinds` 非空时**必须**声明 |
 
-Action 表约束的是 manifest 中声明的副作用类别；syscall 入口仍按 §7.4 独立校验 capability。未列入上表的 syscall 不因缺少 action 而自动**禁止**；它们由 capability、必要程序身份或 fixed-only 规则约束。未知 action 仍按下文规则拒绝。
+Action 表约束的是 manifest 中声明的副作用类别；syscall 入口仍按 §7.4 独立校验 capability。未列入上表的 syscall 不因缺少 action 而自动**禁止**；它们由 capability、必要程序身份或 fixed-only 规则约束。`envelope.emit(kind=execute)` 不由 `emit_output` action 覆盖；若发行版允许普通程序写 execute envelope，其授权完全由 `envelope.emit` capability 与发行版运行时策略控制，manifest **不需要**也**禁止**声明额外 action。未知 action 仍按下文规则拒绝。
 
 **Action 集边界**：Action 集是**闭集**，**禁止**扩展；编辑输出由 `emit_output` 覆盖，ack 与 capability grant 均由既有 envelope / capability 机制表达。
 
@@ -1457,7 +1463,7 @@ Hook --> Model : 展开结果
 @enduml
 ```
 
-同一 ref 可出现多次（共享 blob）。resolve 失败（`E_REF_EXPIRED` 等）时 kernel **必须** 让模型看到明确错误，**禁止**静默忽略；该错误描述或错误 envelope body 在注入 context 前**必须**执行 `I-EMIT-ESCAPE`。
+同一 ref 可出现多次（共享 blob）。resolve 失败（`E_REF_EXPIRED` 等）时 kernel **必须**让模型看到明确错误，**禁止**静默忽略；该错误**必须**通过 `<lmsc_output>` 系统错误 envelope 或发行版声明的等价结构呈现。推荐属性头至少包含 `from="system"`、`status="error"`、`schema="ref_resolve_error"`；body 至少包含 `error_code` 与脱敏后的 `kind` / `id` 摘要。该错误 envelope body 或等价错误描述在注入 context 前**必须**执行 `I-EMIT-ESCAPE`。
 
 > **Rollback 搜索使用 ref 展开后的 context**：`token_rollback` 的 pattern 匹配（§13.3）在 **ref 展开后的 context** 上进行，即 `<lmsc_ref>` envelope 已被其 resolved content 替换后的实际 token 序列；搜索不穿透原始 ref envelope 符号，只看最终注入 context 的字节。
 
@@ -1592,7 +1598,7 @@ end note
 | DISPATCHING | 程序路径 A3（`token_rollback`） | DISPATCHING | 截断 KV；不改变状态机状态本身；dispatcher frame 栈保持；audit `rollback` |
 | GENERATING | EOS | IDLE | 结束当前 turn |
 | IN_ENVELOPE | EOS | IDLE | 协议终止；abort 当前 envelope，注入必要 close 或执行 §6.5.1.1 清理路径，写 `abort` / `protocol_violation` audit |
-| DISPATCHING | EOS observed | IDLE | DISPATCHING 下模型**应**避免产生 EOS；若适配层观测到，写 `protocol_violation` 并 abort 当前 dispatch |
+| DISPATCHING | EOS observed | IDLE | DISPATCHING 下模型**应**避免产生 EOS；若适配层观测到，写 `protocol_violation` 并按 C3 等价路径 abort 当前 dispatch（见 §5.3 B2 / §8.5） |
 | * | abort (external) | IDLE | C3 |
 
 `DISPATCHING | handler 返回` 的下一状态判定如下：handler 未向 context 注入可继续采样的 envelope/content 且无 resume payload 时回 IDLE；handler 通过 `envelope.emit` 或合法 token injection 产生模型可见续写上下文时回 GENERATING；若返回路径触发 suspend / preempt / abort，则按对应路径覆盖。
@@ -1632,9 +1638,9 @@ fn recover_outer_state(kv_after_truncate):
 |---|---|---|
 | `allowed` | 与默认行为一致：envelope 外可出现普通自然语言 token | 不强制（默认值） |
 | `audit-only` | 允许通过，但每段连续 envelope 外裸文本 emit 一条 audit `kind=raw_text_outside_envelope` | token stream hook 观察后写 audit；不构成 violation |
-| `forbidden` | envelope 外仅允许「合法 LMSC 协议入口集合」：四种 envelope open（`<lmsc_execute>` / `<lmsc_output>` / `<lmsc_edit>` / `<lmsc_rollback>`）、`<|lmsc_suspend|>`、EOS | 启用 `I-STRICT-ENVELOPE-ONLY`（§4.4）：L0 / L1 **必须**在 sampler hook 中以 logit mask 强制；L2 由 token stream hook 事后识别后走 §6.5.1 同等的 `protocol_violation` 路径，返 `E_PROTOCOL_VIOLATION` |
+| `forbidden` | envelope 外仅允许「合法 LMSC 协议入口集合」：四种 envelope open（`<lmsc_execute>` / `<lmsc_output>` / `<lmsc_edit>` / `<lmsc_rollback>`）、`<|lmsc_suspend|>`、`<lmsc_ref>` open、EOS | 启用 `I-STRICT-ENVELOPE-ONLY`（§4.4）：L0 / L1 **必须**在 sampler hook 中以 logit mask 强制；L2 由 token stream hook 事后识别后走 §6.5.1 同等的 `protocol_violation` 路径，返 `E_PROTOCOL_VIOLATION` |
 
-> `<|lmsc_abort|>` 受 `I-ABORT-SCOPED` 限制不属于 envelope 外合法入口；这意味着 strict + `forbidden` 模式下，模型**无法**在 turn 中段「主动结束当前一切」，只能依赖 EOS 或外部 abort。`<lmsc_ref>` open 在 §4.4 `I-REF-ANY` 下**可**出现在任何 envelope body 与普通 chunk 中；strict + `forbidden` 模式下 envelope 栈深 = 0 处的 `<lmsc_ref>` open **应**视为合法入口（与 envelope open 同等地位），以避免与 `I-REF-ANY` 冲突——即 entry set 在该模式下扩展为：四种 envelope open、`<|lmsc_suspend|>`、`<lmsc_ref>` open、EOS。
+> `<|lmsc_abort|>` 受 `I-ABORT-SCOPED` 限制不属于 envelope 外合法入口；这意味着 strict + `forbidden` 模式下，模型**无法**在 turn 中段「主动结束当前一切」，只能依赖 EOS 或外部 abort。`<lmsc_ref>` open 在 §4.4 `I-REF-ANY` 下**可**出现在任何 envelope body 与普通 chunk 中；strict + `forbidden` 模式下 envelope 栈深 = 0 处的 `<lmsc_ref>` open **必须**视为合法入口（与 envelope open 同等地位），以避免与 `I-REF-ANY` 冲突——即 entry set 在该模式下为：四种 envelope open、`<|lmsc_suspend|>`、`<lmsc_ref>` open、EOS。
 
 > **`audit-only` 中"连续 span"的边界**· 一段 envelope 外裸文本 span 起于 turn 起点或上一个保留 token 边界，止于下一个保留 token（任一 envelope open / control 单 token / `<lmsc_ref>` open）、EOS 或 IDLE 任一首次出现处。span 字节数若超过 `CHUNK_MAX_TOKENS` 对应的字节预算，kernel **必须**按 `CHUNK_MAX_TOKENS` 粒度分片 emit `kind=raw_text_outside_envelope` audit（§14.2）；同一 turn 内**禁止**对同一字节范围重复 emit。
 
@@ -1651,7 +1657,7 @@ scaffold 注入的属性头**必须**至少包含：
 
 scaffold 注入**禁止**预填 `program` 属性。原因：注入瞬间模型尚未生成 body，kernel 无从得知 `argv[0]`；调度目标仍**必须**在 `</lmsc_execute>` close 后从 body 首词解析（与 §8 现有路由语义一致），避免与 attrs 形成「双重真相来源」。实现**可**在属性头中追加诊断字段（如 `scaffold="execute"`），仅供 audit / debugger 使用，**禁止**作为调度依据。
 
-> **scaffold 注入与 A4 `token_inject` 的关系**· scaffold 注入是 kernel-internal 直注入路径，**不**走程序侧 A4 `token_inject` syscall，因此**禁止**计入 `INJECT_MAX_TOKENS` 配额，也**不**触发 `inject` 类 audit。kernel **必须** emit `kind=envelope_open` audit（与普通 envelope open 同 schema），details 含 `source="kernel:scaffold"` 与 `from="model"`，以便观测者将其与模型自发开启的 envelope 区分。scaffold 触发的 envelope 一旦开启，后续 body 与 close 由模型生成，**视作普通 envelope 处理**：受 `I-CTRL-INSIDE-ENV`、`EMIT_BODY_MAX_BYTES`、§6.5.1.1 EOS fallback 等所有既有约束保护。
+> **scaffold 注入与 A4 `token_inject` 的关系**· scaffold 注入是 kernel-internal 直注入路径，**不**走程序侧 A4 `token_inject` syscall，因此**禁止**计入 `INJECT_MAX_TOKENS` 配额，也**不**触发 `inject` 类 audit。kernel **必须** emit `kind=envelope_open` audit，schema 见 §14.2；该 schema 与发行版选择记录的普通 envelope open audit 兼容，但普通模型自发 open 是否 emit 仍由 §14.2 定义。scaffold 路径 details 含 `open_source="kernel:scaffold"` 与 `envelope_from="model"`，以便观测者将其与模型自发开启的 envelope 区分。scaffold 触发的 envelope 一旦开启，后续 body 与 close 由模型生成，**视作普通 envelope 处理**：受 `I-CTRL-INSIDE-ENV`、`EMIT_BODY_MAX_BYTES`、§6.5.1.1 EOS fallback 等所有既有约束保护。
 
 scaffold 触发对应的状态转移如下（在前述 §10.1 主转移表之外**附加**，仅 `auto_execute_scaffold=true` 时生效）：
 
@@ -2013,7 +2019,7 @@ Optional runtime admin extension（如 `runtime admin persona-refresh`）按 `ru
 
 `envelope.emit` 不支持 token-id 流形式的 body；token id 级注入仅属于 A4 `tokens.inject`，并受 §13.4 的保留 token 注入边界约束。若发行版扩展 token-id body，**必须**另行登记签名、size、转义、chunk observation、backpressure 与错误码；本规范正文不定义该路径。
 
-> **转义后 context 字节**：rollback pattern 匹配的是**实际注入 context 的字节**（即已经过转义处理的内容），而**非**注入前的原始字节。这意味着若某段内容在注入时被视觉等价替换，pattern 须匹配替换后的字符。对模型路径和程序路径（A3）均适用。
+> **转义后 context 字节**：rollback pattern 匹配的是**实际注入 context 的字节**（即已经过转义处理的内容），而**非**注入前的原始字节。这意味着若某段内容在注入时被视觉等价替换，pattern 须匹配替换后的字符。例：程序通过 `envelope.emit` 写入原始文本 `<lmsc_output>` 时，默认映射实际进入 context 的字节为 `‹lmsc_output>`；之后若要 rollback 该片段，pattern 必须写 `‹lmsc_output>`，而不是 `<lmsc_output>`。对模型路径和程序路径（A3）均适用。
 
 ## 13.3 Rollback 边界
 
@@ -2049,7 +2055,7 @@ A3 与模型路径 `<lmsc_rollback>` 的模式匹配搜索窗口**禁止**跨越
 
 **Scope=Turn 实际上界** · `scope=Turn` 的实际最远回退点按以下两条规则取较近者：若存在未关闭 envelope 则取**最外层**未关闭 envelope 的 open token 紧后；否则取当前 turn IDLE 起点。
 
-**Scope=Envelope 搜索起点** · `scope=Envelope` 的搜索起点为触发 rollback 时当前最内层非 rollback envelope 的 open token之后（不含该 open token 与属性头）。若 rollback 本身在普通 chunk 中触发且当前没有非 rollback envelope，则退化为当前 turn IDLE 起点；若处于恢复状态，则使用 §10.1.1 恢复出的最近 envelope / turn 起点。
+**Scope=Envelope 搜索起点** · `scope=Envelope` 的搜索起点为触发 rollback 时当前最内层非 rollback envelope 的 open token之后（不含该 open token 与属性头）。若 rollback 本身在普通 chunk 中触发且当前没有非 rollback envelope，则退化为当前 turn IDLE 起点；若 rollback 刚完成截断并已按 §10.1.1 恢复外层状态，则使用该算法恢复出的最近 envelope / turn 起点。
 
 **Pattern 内容约束** · pattern body 自身**禁止**包含任何保留 token 的字面字节序列（`I-ROLLBACK-NO-NEST`）；长度 ≤ `ROLLBACK_PATTERN_MAX_BYTES`（默认 512，附录 F）。
 
@@ -2170,7 +2176,7 @@ AuditRecord := {
 | `program_unregister` | E | name |
 | `program_register_failed` | E / `on_load` 返错 | name, error_code, reason（error summary）
 | `preempt` | C4 | program, reason, **`envelope_from`**|
-| `rollback` | A3 / `</lmsc_rollback>` close | `outcome`∈{`truncated`,`pattern_not_found`,`pattern_out_of_bound`}, `scope`, `pattern_bytes_len`, `truncated_tokens`（`outcome=truncated` 时）, `effective_bound ∈ {turn_start, nearest_open_envelope, boot_output, rollback_safe_false, fork_point, pin_region, user_input_region, search_max_bytes}`, **`envelope_from`**|
+| `rollback` | A3 / `</lmsc_rollback>` close | `outcome`∈{`truncated`,`pattern_not_found`,`pattern_out_of_bound`}, `scope`, `pattern_bytes_len`, `truncated_tokens`（`outcome=truncated` 时）, `effective_bound ∈ {turn_start, nearest_open_envelope, boot_output, rollback_safe_false, fork_point, pin_region, user_input_region, search_max_bytes}`, `rollback_origin`∈{`"model"`,`"program:<name>"`}；**禁止**使用 `envelope_from` |
 | `rollback_error` | A3 syscall 返错（程序路径）；或模型路径 `</lmsc_rollback>` close 时识别违规（pattern 为空 / 过长 / 含保留 token）——模型路径**不**向任何调用方返错，仅 emit 本 audit | `error_code`, `scope`, `pattern_bytes_len`（pattern 原文**不入 audit**，避免敏感串落盘）|
 | `rollback_failure_summary` | 严格模式压缩 rollback failure audit | `suppressed_count`, `first_seq`, `last_seq`, `outcomes`, `error_codes` |
 | `abort` | C3 | envelope_id, reason, **`envelope_from`**|
@@ -2183,7 +2189,7 @@ AuditRecord := {
 | `raw_text_outside_envelope` | strict 协议模式且 `features.raw_text_outside_envelope="audit-only"` 时（§10.1.2），envelope 栈深 = 0 处出现的连续裸文本 span（非 violation，仅审计） | `bytes_observed: u64`, `token_count: u32`, `turn_id`, `span_start_token_index`, `span_end_token_index`；**禁止**包含 body 明文。默认 `scope=system-only`，发行版**可**显式降为 `model-visible` |
 | `persona_refresh` | `runtime admin persona-refresh`（§12.3.1） | diff_blob_id, boot_refresh_reason |
 | `envelope_emit` | B3 `envelope.emit` 成功返回 | kind, attrs_keys, body_bytes_len, stream（bool）, chunk_observed? |
-| `envelope_open` | envelope open 事件（仅 scaffold 注入路径**必须** emit；模型自发 open **可**省略本 audit，由发行版决定） | `kind`∈{`execute`,`output`,`edit`,`rollback`}, `id`, `from`∈{`"model"`,`"program:<name>"`}, `source`∈{`"model"`,`"kernel:scaffold"`}；scaffold 注入路径下 `source="kernel:scaffold"` 与 `from="model"` **必须**出现（§10.1.2 / §16.1 C-N4）；非 scaffold 路径下 `source` **可**省略或为 `"model"`。默认 `scope=system-only` |
+| `envelope_open` | envelope open 事件（仅 scaffold 注入路径**必须** emit；模型自发 open **可**省略本 audit，由发行版决定） | `envelope_kind`∈{`execute`,`output`,`edit`,`rollback`}, `envelope_id: string`, `envelope_from`∈{`"model"`,`"program:<name>"`}, `open_source`∈{`"model"`,`"kernel:scaffold"`}；若顶层 `AuditRecord.envelope_id` 存在，`details.envelope_id` **必须**与之相等；scaffold 注入路径下 `open_source="kernel:scaffold"` 与 `envelope_from="model"` **必须**出现（§10.1.2 / §16.1 C-N4）；非 scaffold 路径下 `open_source` **可**省略或为 `"model"`。默认 `scope=system-only` |
 
 ### 14.2.1 发行版扩展与模型可见投影
 
@@ -2306,6 +2312,7 @@ E_ROLLBACK_PATTERN_NOT_FOUND # 依 outcome 区分 not_found vs out_of_bound
 E_ROLLBACK_PATTERN_TOO_LONG
 E_ROLLBACK_PATTERN_INVALID
 E_INJECT_BAD_TOKEN
+E_INJECT_BAD_POSITION
 E_INJECT_CAP_DENIED
 E_INJECT_TOO_LARGE
 E_FORK_INVALID
@@ -2318,7 +2325,7 @@ E_ATOMIC_UNSUPPORTED
 # B
 E_DISPATCH_REENTRY
 E_DISPATCH_TIMEOUT # dispatch 超时；retryable=impl-defined，默认 true
-E_EMIT_STREAM_OPEN # handler 持有未关闭流式 emit 时触发 dispatch / persona-refresh / session.fork；retryable=false
+E_EMIT_STREAM_OPEN # handler 持有未关闭流式 emit 时触发 dispatch / persona-refresh / session.fork；retryable=false；details 至少含 reason="streaming_emit_in_progress" 与 open_stream_count: u32；可安全暴露时含未关闭 envelope_id 列表
 E_UNKNOWN_PROGRAM
 E_HANDLER_PANIC
 E_EMIT_ESCAPE_VIOLATION # body 或 attribute header 值含保留 token 字面；retryable=false（内容问题，重试无效）
@@ -2463,7 +2470,7 @@ E_FORK_MEM_EXCEEDED
 - **C-N1** · 当 `features.strict_protocol_mode=true` 且 `features.raw_text_outside_envelope="forbidden"` 时（§10.1.2），L0 / L1 实现**必须**在 sampler hook 中以 logit mask 强制 §4.4 `I-STRICT-ENVELOPE-ONLY`：在 `GENERATING` 状态且 envelope 栈深 = 0 处，`<lmsc_execute>` / `<lmsc_output>` / `<lmsc_edit>` / `<lmsc_rollback>` / `<|lmsc_suspend|>` / `<lmsc_ref>` open / EOS 之外的所有 token **必须**被 mask 屏蔽（`<lmsc_ref>` open 纳入入口集是为与 `I-REF-ANY` 保持一致——ref **可**出现在任何 envelope body 与普通 chunk 中）；L2 实现按 §6.5.1 第 10 条事后识别后走 `kind=protocol_violation`（`invariant=I-STRICT-ENVELOPE-ONLY`）。**禁止**两级实现把本约束降级为「事后丢弃」或「截断单 token」。
 - **C-N2** · 当 `features.raw_text_outside_envelope="audit-only"` 时（§10.1.2），envelope 栈深 = 0 处出现的连续裸文本 span，kernel **必须** emit `kind=raw_text_outside_envelope` audit（§14.2，schema 见同节），且**禁止**返 `E_PROTOCOL_VIOLATION`、**禁止**触发 abort。`audit-only` 与 `forbidden` 互斥；同一 turn 内**禁止**对同一 span 同时 emit `protocol_violation` 与 `raw_text_outside_envelope`。
 - **C-N3** · 当 `features.auto_execute_scaffold=true` 时（§10.1.2），kernel 注入的 `<lmsc_execute>` open 紧随的 kernel-owned 属性头**必须**含 `id` 与 `from="model"`，且**禁止**含 `program` 字段；调度目标**必须**仍由 `</lmsc_execute>` close 后的 body 首词解析。任何把 `program` 预填入 scaffold 属性头并据此跳过 body 首词路由的实现**不**合规。
-- **C-N4** · scaffold 注入**必须**只在 `GENERATING` 状态且 envelope 栈深 = 0 时发生；其余状态（`IN_ENVELOPE`、`DISPATCHING`、`SUSPENDED`、`INIT`、`IDLE` 在未离开前）**禁止**触发 scaffold。scaffold 注入路径**必须** emit audit `kind=envelope_open`，details 含 `source="kernel:scaffold"` 与 `from="model"`；该路径**禁止**计入 `INJECT_MAX_TOKENS` 配额，与程序 A4 `token_inject` 共用同一计数器**不**合规。
+- **C-N4** · scaffold 注入**必须**只在 `GENERATING` 状态且 envelope 栈深 = 0 时发生；其余状态（`IN_ENVELOPE`、`DISPATCHING`、`SUSPENDED`、`INIT`、`IDLE` 在未离开前）**禁止**触发 scaffold。scaffold 注入路径**必须** emit audit `kind=envelope_open`，details 含 `open_source="kernel:scaffold"` 与 `envelope_from="model"`；该路径**禁止**计入 `INJECT_MAX_TOKENS` 配额，与程序 A4 `token_inject` 共用同一计数器**不**合规。
 
 ### 16.1.1 最小合规测试矩阵
 
