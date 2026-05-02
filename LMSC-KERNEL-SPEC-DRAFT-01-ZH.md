@@ -357,6 +357,7 @@ str_char = ( ? 任意 Unicode 字符，除 '"' 、 '\' 、 LF 、 CR 、 Tab（0
  | "\\\"" | "\\\\" ; (* Tab 被排除，以避免属性值词法边界模糊 *)
 ws = { " " | "\t" } ; (* 属性头在行内，不跟换行；首属性前必须有 ws *)
 line_end = "\n" | "\r\n" ;
+ (* `attr_header` 末尾的 `line_end , line_end` 即两次 `line_end` 重复，等价于 attrs 末尾出现一个**空行**。`\r\n` 视为单个 `line_end`，**禁止**被拆分为两个 `line_end` 形成假空行。 *)
 letter = "A" .. "Z" | "a" .. "z" ;
 digit = "0" .. "9" ;
 
@@ -857,7 +858,7 @@ blob.stat(id) -> Option<BlobInfo>
 ```
 
 - `BlobId` 是不透明句柄；kernel **可以**在内部使用内容寻址去重，但返回给程序的 `BlobId` **禁止**被规范解释为裸内容哈希，程序也**不得**依赖同内容跨 session / 跨程序得到相同 ID。`blob.put(data)` 成功时，调用 session **必须**获得一个 session-level blob 引用：若内容新建，则初始 refcount = 1；若实现选择内部去重并命中既有 blob，则 refcount 对该调用 session 增加 1。kernel **必须**把返回的 `BlobId` 加入当前 session 的 `session -> Set<BlobId>` 持有集合。refcount=0 且 GC 通过后删除。
-- 默认安全模型为 **opaque bearer handle**：知道某个有效且当前 session 可访问的 `BlobId` 等价于获得读取该 blob 的授权。blob 不继承 §5.7 F1 的 program kv namespace 隔离；其程序隔离边界见 §13.10。发行版若把 `BlobId` 暴露为裸内容哈希，**必须**在 `runtime info.features.blob_id_mode="content_hash"` 中声明，并且**不得**把该模式用于敏感或低熵内容，除非同时启用并声明 per-session / per-program ACL（`blob_id_mode="acl"` 或发行版等价扩展）。发行版处理敏感或低熵内容时，**必须**使用不可猜测 opaque id，或为敏感 blob 启用 per-session / per-program ACL；**禁止**假设裸内容哈希天然保密。
+- 默认安全模型为 **opaque bearer handle**：知道某个有效且当前 session 可访问的 `BlobId` 等价于获得读取该 blob 的授权。blob 不继承 §5.7 F1 的 program kv namespace 隔离；其程序隔离边界见 §13.10。`runtime info.features.blob_id_mode` 在 V1 下的合法枚举仅为 `{"opaque","content_hash"}`；发行版若把 `BlobId` 暴露为裸内容哈希，**必须**在 `runtime info.features.blob_id_mode="content_hash"` 中声明，并且**不得**把该模式用于敏感或低熵内容。per-session / per-program ACL 在 V1 **不是** `blob_id_mode` 的枚举值，而是作为独立的发行版扩展（例如 `features.blob_acl="per_session"`）提供；带 ACL 的实现仍**必须**独立于 `blob_id_mode` 声明其语义。发行版处理敏感或低熵内容时，**必须**使用不可猜测 opaque id，或为敏感 blob 启用 per-session / per-program ACL扩展；**禁止**假设裸内容哈希天然保密。
 
 > **非规范性说明**：blob 的 GC 时机是实现自由度；kernel 仅保证 refcount 归零后**禁止**再返回该 blob 的内容（`blob.get` 返 `E_BLOB_NOT_FOUND`），但具体回收可延迟至批量 GC。程序**应**避免假设 `decref` 调用后内存立即释放。session 结束或 `drop_fork` 释放某一分支时，kernel 对该 session 持有集合中的 BlobId 执行 session-level `decref`；程序显式 `blob.decref` 只能释放调用方 session 所持的那份引用。
 
@@ -1515,6 +1516,8 @@ Hook --> Model : 展开结果
 
 同一 ref 可出现多次（共享 blob）。resolve 失败（`E_REF_EXPIRED` 等）时 kernel **必须**让模型看到明确错误，**禁止**静默忽略；该错误**必须**通过 `<lmsc_output>` 系统错误 envelope 或发行版声明的等价结构呈现。推荐属性头至少包含 `from="system"`、`status="error"`、`schema="ref_resolve_error"`；body 至少包含 `error_code` 与脱敏后的 `kind` / `id` 摘要。该错误 envelope body 或等价错误描述在注入 context 前**必须**执行 `I-EMIT-ESCAPE`。
 
+> **ref resolve 失败的 audit 归因（规范性）**· kernel 注入的 ref-resolve 错误 envelope（与 strict 顶层 ref materialization 路径下的系统 envelope）**必须**以 §14.2 的 `kind=envelope_open` audit 表达 envelope 的开启，details 含 `envelope_kind="output"`、`envelope_from="system"`、`open_source="kernel:ref_resolve_error"`（strict 顶层 materialization 用 `open_source="kernel:ref_resolve_strict_top"`），`source` 字段固定为 `"kernel"`。若失败由 `I-STRICT-ENVELOPE-ONLY` 等 invariant 违规触发，则**必须**先 emit `kind=protocol_violation`，再 emit 上述 `envelope_open`；两条 audit 顺序与时序**禁止**颠倒。该错误 envelope 由 kernel 直接注入，**禁止**触发 self-output-edit observer，亦**禁止**以 `kind=envelope_emit` 表示（`envelope_emit` 仅用于 B3 程序态 emit）。
+
 该系统错误 envelope 由 kernel 直接注入，**不**属于某个 emitting handler 的 `envelope.emit(kind=output|edit)` 路径，因此**不**触发 §8.2 `features.envelope_chunk_observation="self-output-edit"` 的 `on_envelope_chunk` 回调。发行版若另行提供全局 observer，必须在扩展规范中定义过滤、去重与防循环规则。
 
 > **外部 ID canonicalization（非规范互操作建议）**：ref 微文法保持严格 ASCII 安全集，kernel 不放宽 `I-REF-CHARSET`。把外部系统 ID 映射为 `ref.id` 时，推荐使用 `base64url(no_padding(utf8_bytes))` 保留可逆性，或使用 `sha256:<hex-prefix>` / `sha256:<full-hex>` 保留短而稳定的不可逆 id。resolver manifest、ref registry metadata 或发行版扩展 audit **应**记录 `external_id_scheme` 与 collision 策略（例如 prefix 长度、冲突时二次扩展或拒绝绑定）；kernel 不为不同 scheme 自动做 canonical 等价比较。
@@ -2122,7 +2125,7 @@ A3 与模型路径 `<lmsc_rollback>` 的模式匹配搜索窗口**禁止**跨越
 
 1. **结构边界仍然生效**· null 仅取消独立 lookback 上限，不放松上述结构边界（已关闭 envelope、open token、boot / pin / input region、`rollback_safe=false` 屏障、turn IDLE 起点、父 session 边界）。
 2. **算法复杂度承诺**· rollback 模式匹配的实际搜索**必须**为相对窗口字节数线性时间，即 `O(window_bytes + len(pattern))`（典型实现：从尾部向前一次遍历 + KMP / Aho-Corasick 等线性匹配，或字节级 reverse-suffix 搜索）。**禁止**采用最坏情形 `O(window_bytes · len(pattern))` 或更高复杂度的实现。
-3. **运行时可观测**· 当 `ROLLBACK_SEARCH_MAX_BYTES=null` 时，每次 rollback 计算的 audit details **应**额外暴露 `effective_search_window_bytes`（本次匹配实际遍历的字节数上界）字段；`runtime info.stats`（若提供）**应**暴露 `rollback_search_max_bytes_effective`（自启动以来观察到的最大窗口字节数）。这两项**应**字段而非**必须**字段，目的是允许观测者监控发行版是否在长 turn / 大 context 场景下出现搜索窗失控。
+3. **运行时可观测**· 当 `ROLLBACK_SEARCH_MAX_BYTES=null` 时，每次 rollback 计算的 audit details **必须**额外暴露 `effective_search_window_bytes`（本次匹配实际遍历的字节数上界）字段；`runtime info.stats`（若提供）**应**暴露 `rollback_search_max_bytes_effective`（自启动以来观察到的最大窗口字节数）。`ROLLBACK_SEARCH_MAX_BYTES` 非 null 时 `effective_search_window_bytes` 为**应**字段。本条目的是允许观测者监控发行版是否在长 turn / 大 context 场景下出现搜索窗失控。
 
 发行版**可**选择设置 `ROLLBACK_SEARCH_MAX_BYTES` 为有限值（推荐至少覆盖 256 KiB 量级），亦**可**保持 `null`；选择 null 时上述三条**必须**全部满足。两种设置均**禁止**以静默 best-effort 截断方式处理大窗口（即遇到大窗口直接放弃搜索而 emit `pattern_not_found`）。
 
@@ -2203,6 +2206,8 @@ A4 **禁止**：
 ## 13.10 程序隔离
 
 - 不同程序的 kv 命名空间物理隔离；blob 不属于 program kv namespace 隔离语义，`blob.get` / `incref` / `decref` 均**不需 cap**，但 `BlobId` 的安全模型以 §5.7 F2 为准：默认是 opaque bearer handle，泄露即授权；若发行版声明 `features.blob_id_mode="content_hash"`，则该模式**不得**用于敏感或低熵内容，除非同时启用 per-session / per-program ACL。敏感或低熵 blob 的 secrecy 必须由不可猜测 opaque ID 或 ACL 保障；实际读写仍仅作用于调用 session 所持有的那份 refcount；
+
+  > **`content_hash` 模式与 ref 内联的隐私警告（规范性）**· 当 `features.blob_id_mode="content_hash"` 时，任何把 `BlobId` 暴露给模型可见上下文的路径——包括 `ref.resolve` 内联展开后让模型看到原 blob 引用、把 `BlobId` 写入 envelope body、persist edit 后的 `archived_blob_id` 等——都**可能**让模型通过哈希值确认低熵内容（敏感字段、短口令、可枚举身份号、布尔事实）。发行版**必须**在如下场景之一时切换为 `blob_id_mode="opaque"` 或启用 per-session ACL：(a) 引用内容来自外部不可信来源；(b) 引用内容低熵或可枚举；(c) 模型可见上下文中可能出现 `BlobId` 字面。本条不构成新 cap，但**必须**反映在发行版安全自评估文档中。
 - kernel 维护 per-session refcount；`blob.decref` 仅能作用于调用方 session 所拥有的 refcount（§9.4.2 集合），对其他 session 的 refcount 无副作用；防止 `decref` 被滥用破坏其他 session 持有的引用；
 - ref_kind 全局唯一；
 - 程序**禁止** 读取另一程序的 audit；
@@ -2243,10 +2248,12 @@ AuditRecord := {
  envelope_id: Option<string>
  capability: Option<string>
  details: Map<string, any>
- hash_prev: bytes? # tamper-evident 可选
- signature: bytes? # tamper-evident 可选
+ hash_prev: bytes? # tamper-evident 可选；启用时算法见下
+ signature: bytes? # tamper-evident 可选；启用时算法见下
 }
 ```
+
+> **审计哈希链算法（规范性）**· 当发行版启用 tamper-evident 链路时，`hash_prev` **必须**取自上一条 record 的 canonical 序列化字节经哈希后的输出；默认哈希算法为 **SHA-256**；链接公式为 `record.hash = SHA-256( record.hash_prev || canonical_bytes(record_without_hash_signature) )`，其中 `||` 为字节拼接，`canonical_bytes` 取自 §14.3 export schema 的 canonical YAML / JSON 序列化（按字段名 ASCII 升序、UTF-8 NFC、整数十进制、布尔小写）。每条记录的 `hash_prev` **必须**等于该公式产生的上一条 `record.hash`；首条记录的 `hash_prev` **应**为全零字节序列或 `session_id` 经 SHA-256 的 32 字节摘要（发行版需在 `runtime info.audit_hash_init` 中明示选择）。`signature` 默认为 **Ed25519**；若发行版选择其他算法（如 ECDSA-P256-SHA256），**必须**在 §14.3 export 与 `runtime info.features.audit_signature_alg` 中如实声明。所有声明启用 tamper-evident 的发行版**必须**在导出 schema（附录 H）中暴露 `hash_algorithm`、`signature_algorithm` 字段，以保证跨实现互验。
 
 > **`seq` 与 `turn_id` 语义**· `seq` 为 **per-session 独立单调递增**，`session_id` 作为归属字段；fork 子 session 从 fork 点 seq 起延续（不从 0 重计）。`turn_id` 为 **per-session 独立单调递增**：每次离开 IDLE 时 +1；fork 继承父当前值；restore 不改变 turn_id。
 
@@ -2263,7 +2270,7 @@ AuditRecord := {
 | `program_register` | E | name, version |
 | `program_unregister` | E | name |
 | `program_register_failed` | E / `on_load` 返错 | name, error_code, reason（error summary）
-| `preempt` | C4 | program, reason, **`envelope_from`**|
+| `preempt` | C4 | program, `reason ∈ {"user_interrupt","priority_alert","resource_limit","watchdog","x-<vendor>-<name>"}`, **`envelope_from`**, `cooldown_ms?`；preempt 成功后 kernel 注入 envelope 时**必须**额外 emit 一条 `envelope_open`（`open_source="kernel:preempt"`），与本条 audit 的顺序为先 `preempt` 再 `envelope_open` |
 | `rollback` | A3 / `</lmsc_rollback>` close | `outcome`∈{`truncated`,`pattern_not_found`,`pattern_out_of_bound`}, `search_scope`, `pattern_bytes_len`, `truncated_tokens`（`outcome=truncated` 时）, `regions_invalidated`（成功截断触发 region cleanup 时）, `effective_bound ∈ {turn_start, nearest_open_envelope, boot_output, rollback_safe_false, fork_point, pin_region, user_input_region, search_max_bytes}`, `rollback_origin`∈{`"model"`,`"program:<name>"`}；**禁止**使用 `envelope_from` |
 | `rollback_error` | A3 syscall 返错（程序路径）；或模型路径 `</lmsc_rollback>` close 时识别违规（pattern 为空 / 过长 / 含保留 token）——模型路径**不**向任何调用方返错，仅 emit 本 audit | `error_code`, `search_scope`, `pattern_bytes_len`（pattern 原文**不入 audit**，避免敏感串落盘）, `storm_locked?` |
 | `rollback_failure_summary` | 严格模式压缩 rollback failure audit | `suppressed_count`, `first_seq`, `last_seq`, `outcomes`, `error_codes` |
@@ -2579,7 +2586,7 @@ E_FORK_MEM_EXCEEDED
 - **C-N10** · 当前 turn 的 input region **必须**仅由 §13.3 所列允许路径创建（宿主用户消息注入、C2 `resume` 外部事件 payload、发行版显式声明的「外部输入桥接」），audit `source` 字段**必须**符合 `external_input:<bridge>` 形式或表明用户消息来源。`envelope.emit` / A4 `token_inject` / persona-refresh pin / `ref.resolve` 展开 / scaffold 注入 / boot output 等路径**禁止**被实现登记为 input region。同 turn 多次输入**必须**作为有序区间集合记录，**禁止**合并为单一连续区间。
 - **C-N11** · 程序 `register` 后至 `on_load` 成功返回前，程序处于 `status=loading`（§8.2）。kernel **必须**对外部 B2 dispatch / syscall 路由 / scaffold 等任何路径返 `E_PROG_NOT_FOUND`（建议 `details.reason="loading"`）；`program.list` 模型可见视图**必须**默认隐藏 loading 程序或带 `status="loading"` 标记，仅 `program.admin` 与程序自身可在 `on_load` 期间观察到自己；`on_load` 失败时 kernel **必须**回滚程序入表与命名空间 metadata，并按既有 audit 规则记录。
 - **C-N12** · 任何在 `on_envelope_chunk` reject 路径或 `on_abort` 中以 `envelope_id="pending"` 触达 envelope-state syscall（envelope.emit 续写、envelope.close、region.* 查询/写入、audit.emit、tokens.inject AtEnvelopeClose 等）的程序调用，kernel **必须**返 `E_ABORT_NOT_OPEN`（建议 `details.reason="pending_not_open"`）并 emit `kind=protocol_violation`（§6.5.2）。`pending` id **禁止**被 kernel 重映射为最终 envelope id。
-- **C-N13** · 当 `ROLLBACK_SEARCH_MAX_BYTES` 设为非 null 时，超出独立 lookback 窗的最近匹配**必须** audit `outcome=pattern_out_of_bound`、`effective_bound="search_max_bytes"`，**禁止**降级为 `pattern_not_found`。当设为 null 时 (a) 结构边界仍生效；(b) 模式匹配实现**必须**为 `O(window_bytes + len(pattern))` 线性时间，**禁止**最坏二次或更高复杂度；(c) audit details **应**额外暴露 `effective_search_window_bytes`，且 `runtime info.stats`（若提供）**应**暴露 `rollback_search_max_bytes_effective`（§13.3）。任一设置下**禁止**静默 best-effort 截断后归为 `pattern_not_found`。
+- **C-N13** · 当 `ROLLBACK_SEARCH_MAX_BYTES` 设为非 null 时，超出独立 lookback 窗的最近匹配**必须** audit `outcome=pattern_out_of_bound`、`effective_bound="search_max_bytes"`，**禁止**降级为 `pattern_not_found`。当设为 null 时 (a) 结构边界仍生效；(b) 模式匹配实现**必须**为 `O(window_bytes + len(pattern))` 线性时间，**禁止**最坏二次或更高复杂度；(c) audit details **必须**额外暴露 `effective_search_window_bytes`，且 `runtime info.stats`（若提供）**应**暴露 `rollback_search_max_bytes_effective`（§13.3）。任一设置下**禁止**静默 best-effort 截断后归为 `pattern_not_found`。
 
 ### 16.1.1 最小合规测试矩阵
 
@@ -2855,8 +2862,8 @@ limits:
  session_fork_max_concurrent: int # 对应 `SESSION_FORK_MAX_CONCURRENT`（附录 F.3）；超限亦返 `E_FORK_DEPTH_EXCEEDED`，audit details 置 `reason="concurrent_limit"` 与深度超限区分
  session_fork_mem_limit_mb: int? # 对应 `SESSION_FORK_MEM_LIMIT_MB`（附录 F.3）；null 表示实现不施加配额（仅受物理 OOM 约束）；非 null 时超限 `E_FORK_MEM_EXCEEDED`
  dispatch_timeout_default_ms: int? # 实现可选：当 manifest 未声明 `constraints.max_dispatch_ms` 时使用的缺省值（§8.1）；null 表示默认不启用 dispatch timeout
- persona_refresh_pin_max_active: int? # §12.3.1；features.persona_refresh=true 时必须为有限正数；false 时可为 null
- persona_refresh_pin_max_tokens: int? # §12.3.1；features.persona_refresh=true 时必须为有限正数；false 时可为 null
+ persona_refresh_pin_max_active: int? # §12.3.1；features.persona_refresh=true 时必须为有限正数；false 时**必须出现**且**必须为 null**（不得省略字段）
+ persona_refresh_pin_max_tokens: int? # §12.3.1；features.persona_refresh=true 时必须为有限正数；false 时**必须出现**且**必须为 null**（不得省略字段）
 
 persona: string?
 ```
