@@ -62,7 +62,6 @@ L3 <-up- L4 : invokes
 
 ---
 
-
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
 > Protocol revision: `draft v1`.
@@ -102,7 +101,6 @@ L3 <-up- L4 : invokes
 
 ---
 
-
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
 > Protocol revision: `draft v1`.
@@ -121,7 +119,6 @@ This document uses the keywords from [RFC 2119] and [RFC 8174]:
 The subject of "the kernel **MUST**..." is a conforming implementation. The subject of "a program **MUST**..." is a program deployed on a conforming kernel.
 
 ---
-
 
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
@@ -172,7 +169,7 @@ The required strength of the hooks above is determined by the access-level matri
 
 Programs do not communicate directly with each other. Cross-program collaboration occurs through one of the following:
 - Envelopes (program A's output is dispatched to program B);
-- shared kv / blob namespaces (explicit capability);
+- shared blob namespaces (explicit capability; see §5.7 F2). KV is isolated by program prefix `program:<name>/` by default (see §5.7 F1); **cross-program KV sharing is not defined by this specification**. A distribution **MAY** extend it without breaking P-1 / P-2 or §5.7 F1 isolation, but such extensions are distribution-level and do not constitute spec-level interoperable capabilities;
 - ref resolution chains (a resolver registered by program B is called by the kernel when expanding a ref).
 
 ## 3.3 Basic Principles
@@ -190,7 +187,6 @@ Programs do not communicate directly with each other. Cross-program collaboratio
 **P-5 - No Cross-Layer Dependency** - Normative clauses and the behavior of required programs **MUST NOT** depend on the presence of recommended or ecosystem programs.
 
 ---
-
 
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
@@ -245,15 +241,17 @@ When the kernel sees the `</lmsc_rollback>` close token, it executes the followi
 - Match search **MUST NOT** cross `I-ROLLBACK-BOUND`; search stops when it encounters a boundary;
 - `ROLLBACK_STORM_LIMIT` (default 16 times / turn) remains in effect;
 - **`ROLLBACK_PATTERN_MAX_BYTES` upper-bound enforcement** is level-specific:
-  - **L0 / L1**: the kernel **MUST** use logit masks to ensure that, after a rollback envelope opens, a close token is produced within `ROLLBACK_PATTERN_MAX_BYTES` bytes; at the upper bound it forces a close or `<|lmsc_abort|>`;
+  - **L0 / L1**: the kernel **MUST** use logit masks to ensure that, after a rollback envelope opens, a close token is produced within `ROLLBACK_PATTERN_MAX_BYTES` bytes. **Upper-bound handling (deterministic priority)**: when the next candidate token would make the rollback body byte count = `ROLLBACK_PATTERN_MAX_BYTES` and a close has not yet been produced, the kernel **MUST** select a path in the following order: (a) **prefer** to force-emit `</lmsc_rollback>` (forced close); (b) **only if** the forced close would simultaneously violate other invariants such as `I-ROLLBACK-NO-NEST` / `I-ROLLBACK-NO-ATTR` and therefore cannot legally close, downgrade to forcibly emitting `<|lmsc_abort|>` along the C3 abort path. The two paths **MUST NOT** be silently swapped by a distribution. Audit requirements: path (a) emits `kind=rollback`, with details that **MUST** contain `forced_close=true` and `effective_bound="pattern_max_bytes"`, and is then handled as an ordinary rollback pattern (search, hit / miss, KV truncation, `ROLLBACK_STORM_LIMIT` accounting, region cleanup); a rollback envelope whose body byte count exceeds `ROLLBACK_PATTERN_MAX_BYTES` **MUST NOT** be produced. Path (b) emits both `kind=rollback` (details contain `forced_close=true`, `forced_close_outcome="abort_fallback"`) and `kind=protocol_violation` (invariant=`I-ROLLBACK-BOUND`); KV is unchanged;
   - **L2**: without a sampler hook, the kernel **MUST** maintain a byte counter for the rollback envelope body in the token stream hook, accumulating from open; upon reaching `ROLLBACK_PATTERN_MAX_BYTES`, it immediately follows the C3 abort path and emits audit `kind=protocol_violation` (invariant=`I-ROLLBACK-BOUND`); L2 **MUST NOT** handle this by silent truncation or best-effort behavior.
 
 A model-triggered rollback envelope and a program call to `token_rollback(pattern, scope)` (§5.2 A3) are **semantically equivalent** and share the constraints above.
 
 The `scope` of the model path is inferred as follows:
 
-- If the current state is `IN_ENVELOPE` -> `scope = Envelope`;
-- If the current state is `GENERATING` (no open envelope) -> `scope = Turn`.
+- If, **before** the `<lmsc_rollback>` open, the current sampling position lies inside the body of some **non-rollback** envelope (i.e. the envelope stack contains at least one non-rollback envelope frame) -> `scope = Envelope`;
+- Otherwise (the stack contains no non-rollback envelope, including the `GENERATING` case and the case where only the rollback envelope itself is on the stack) -> `scope = Turn`.
+
+> **The rollback envelope does not participate in scope inference** - Even at the moment the `</lmsc_rollback>` close token is processed, when the rollback envelope is still on top of the envelope stack, scope inference **MUST** consider only the stack state **before** the rollback open; the rollback envelope itself **MUST NOT** count as a "non-rollback envelope body". This subsection is the normative source of truth for "Model-path default scope inference" in §13.3; §13.3 and other locations are references only and **MUST NOT** introduce inference text that conflicts with this subsection.
 
 The inferred result is written into the `search_scope` field in §14.2 rollback audit details; top-level `AuditRecord.scope` still only represents audit visibility and **MUST NOT** be reused for the rollback search range.
 
@@ -306,6 +304,8 @@ The kernel generates or completes an attribute header at the following times:
 - After the model generates a non-rollback envelope open token, the kernel injects a default attribute header (such as `id` and default `from="model"`) before entering body sampling;
 - When `envelope.emit`, boot output, persona-refresh, or other kernel / program paths write an envelope, the kernel generates the attribute header from passed attrs or internal metadata;
 - If an implementation accepts attributes in an open-tag form, it **MUST** first canonicalize them to this attribute header; the normative text, schemas, and tests use this attribute header as the source of truth.
+
+> **Attribute-header injection atomicity (general rule)** - For any non-rollback envelope, the open token and the kernel-owned attribute header that immediately follows **MUST** be completed as an indivisible write unit: from the moment the open token is written to the moment the attribute header's terminating blank line is written, the kernel **MUST NOT** interleave any C1 (suspend) / C3 (abort) / C4 (preempt) control event; control events that arrive during this window **MUST** be queued and handled only after the attribute header is complete. The kernel **MUST NOT** allow program state or the inference stack to observe an intermediate state where "open is written but the attribute header is incomplete". This rule **covers every kernel attribute-header injection path** - including the default attribute header injected after a model-spontaneous open, `envelope.emit` / boot output / persona-refresh writes, auto execute scaffold injection (§10.1.2), and the canonicalization path when the implementation accepts open-tag-form attribute input - not only the scaffold submode. If the implementation decides for any reason to abandon the write, it **MUST** cancel and roll back the related decision **before** the open token is written, and **MUST NOT** emit a `kind=envelope_open` audit. §10.1.2 item 5 retains an equivalent but tighter event-queue rule for the scaffold submode (related to control-event priority arbitration); it does not conflict with this general rule, and on conflict this section prevails as the protocol-surface source of truth.
 
 > **Note** - The `<lmsc_rollback>` envelope **carries no attributes**; its body directly carries the pattern sequence (see §4.1.2a / §4.3 EBNF). In the table below, values such as "all" in the `Applicable envelope` column **exclude** the rollback envelope.
 
@@ -437,7 +437,6 @@ For the three envelope kinds **`execute` / `output` / `edit`**, "**who initiated
 
 ---
 
-
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
 > Protocol revision: `draft v1`.
@@ -562,7 +561,8 @@ Position := BeforeNextSample | AtEnvelopeClose
   - Total length ≤ `INJECT_MAX_TOKENS` (default 4096);
   - The injection **MUST NOT** make the envelope stack exceed `MAX_ENVELOPE_NEST`; injections that would overflow the stack **MUST** return `E_STACK_OVERFLOW`;
   - An envelope close token **MUST NOT** be injected outside an envelope;
-  - `position=AtEnvelopeClose` **MUST** be used only when the current envelope stack is non-empty and the stack top is not a rollback envelope; otherwise the kernel **MUST** return `E_INJECT_BAD_POSITION`.
+  - `position=AtEnvelopeClose` **MUST** be used only when the current envelope stack is non-empty and the stack top is not a rollback envelope; otherwise the kernel **MUST** return `E_INJECT_BAD_POSITION`;
+  - **Token-sequence content invariant (applies to all positions)**: when the injection position lies inside a **non-rollback** envelope body (including the default `position=AtEnvelopeClose` case, and `position=BeforeNextSample` when the current stack top is a non-rollback envelope), the injected token sequence **MUST** satisfy §4.4 `I-CTRL-INSIDE-ENV`: the only reserved tokens permitted are `<|lmsc_abort|>`, `<|lmsc_suspend|>`, a complete `<lmsc_ref>...</lmsc_ref>` ref element, and a nested `<lmsc_rollback>` open; open / close tokens of any other envelope (including `<lmsc_execute>` / `<lmsc_output>` / `<lmsc_edit>` and same-kind nested open / close) **MUST NOT** be injected, even if the caller holds the `tokens.inject.special` cap. The kernel **MUST** validate the entire token sequence at the syscall entry (before sampling / KV write); on violation it **MUST** return `E_INJECT_BAD_TOKEN`, with details preferably containing `reason="ctrl_inside_env_violation"`, and emit audit `kind=protocol_violation` (invariant=`I-CTRL-INSIDE-ENV`). Injection outside any envelope still follows existing rules such as "**MUST NOT** inject envelope close tokens"; rollback envelope bodies are already covered by the previous `AtEnvelopeClose` prohibition rule together with `I-ROLLBACK-NO-NEST`.
 - **Position semantics**:
   - `BeforeNextSample`: insert before the next model sample; the insertion point is the current natural state-machine position;
   - `AtEnvelopeClose`: insert immediately **before** the matching close token of the current innermost open envelope, making the injected tokens part of that envelope body. This position **MUST NOT** be used for a rollback envelope body, to prevent program injection from breaking `I-ROLLBACK-NO-NEST` / `I-ROLLBACK-BOUND` checks for the rollback pattern.
@@ -760,6 +760,14 @@ FrameRules := {
   - **MAY**: `mask_overlay` - optional; when unsupported, `frame.supports("mask_overlay")` returns false.
   - If an unsupported field is passed and is not `None`, push **MUST** return `E_FRAME_UNSUPPORTED_RULE`; programs **SHOULD** first call `frame.supports` to probe.
 - **`program_whitelist` combination semantics**: `None` means that frame adds no whitelist constraint; `Some(non_empty)` allows only the listed `argv[0]` values; `Some([])` explicitly denies all programs. The effective whitelist is the intersection of the base dispatch-reachable program set and every non-`None` `program_whitelist` on the frame stack. Dispatcher frames can only tighten the callable program set; they **MUST NOT** widen restrictions already imposed by manifests, capabilities, or outer frames.
+- **Base dispatch-reachable program set (base set) definition** - The base set is the set of all `argv[0]` values that, **without considering** any `program_whitelist` constraint on the current dispatcher frame stack, can be dispatched in this session right now after applying all of the following filters:
+  1. The program has been registered in the current session via §8 `program.register` and `on_load` has succeeded (programs with `status=loading` or those already `program.unregister`ed are **excluded**);
+  2. The caller's manifest and currently effective capabilities allow dispatching that `argv[0]` (including named grants such as `program.dispatch.<name>`);
+  3. The program's own manifest visibility / call-source constraints (e.g. `caller=kernel` / `caller=program:*` / `dispatchable=false`) admit this call source;
+  4. The required-program routes (`runtime` / `program` / `capability` / `kv`) defined in §12 are unconditionally reachable per spec and **MUST NOT** be removed from the base set by a distribution;
+  5. The distribution's dispatch policy (sandbox / network isolation / egress filter, etc.) does not currently deny that `argv[0]` in this session.
+
+  The base set **MUST NOT** be **widened** by dispatcher frames; it can only be further tightened by any non-`None` `program_whitelist` on the frame stack. The effective callable set = base set ∩ all non-`None` `program_whitelist`s on the frame stack. The model-visible view of `program.list` **SHOULD** be a subset of the base set (with visibility filtering applied) and **MUST NOT** include programs outside the base set; when the model-visible view temporarily disagrees with the base set (for example during `on_load`), the **base set** is the dispatch-authorization source of truth, and `program.list` is only a hint. Whether dispatch succeeds is still decided by base set ∩ frame whitelists.
 - **Notes**: recommended programs such as `focus` / `shell` implement their behavior through this primitive. With MRO and the probing API completed, they are portable across implementations.
 
 ## 5.5 D - Authorization
@@ -973,7 +981,6 @@ clock.cancel(id) -> Result<()>
 
 ---
 
-
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
 > Protocol revision: `draft v1`.
@@ -1160,7 +1167,6 @@ L0 / L1 implementations **MUST** be `native`; only L2 **MAY** declare `buffered`
 
 ---
 
-
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
 > Protocol revision: `draft v1`.
@@ -1269,7 +1275,6 @@ syscalls:
 > **`Stream<Bytes>` ABI under sandbox** - The ABI for `Stream<Bytes>` on sandbox backends (WASM / Lua, etc.) is distribution-defined and is not a normative constraint; the recommended design is a pull callback + backpressure mechanism, with binding documentation that clearly maps `chunk_max_tokens` / backpressure windows and timeout strategy to `E_EMIT_STREAM_BACKPRESSURE_TIMEOUT`.
 
 ---
-
 
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
@@ -1444,7 +1449,6 @@ When a handler panics, dispatch times out, C3 aborts, dispatch ends normally, or
 
 ---
 
-
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
 > Protocol revision: `draft v1`.
@@ -1569,7 +1573,6 @@ A5 fork applies to **the entire session state** (the following list is the norma
 - An implementation **MAY** reject `restore` for a fork generated by a different kernel build id; when rejected, it returns `E_FORK_INVALID` and records the source build / current build in audit. This is a conformance-permitted behavior, not a requirement.
 
 ---
-
 
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
@@ -1731,7 +1734,6 @@ Turn = the interval from leaving IDLE to the next time IDLE is reached. Per-turn
 
 ---
 
-
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
 > Protocol revision: `draft v1`.
@@ -1827,7 +1829,6 @@ Boot and `runtime info` validation **MUST** satisfy: fixed-only capabilities **M
 > **External decider SHOULD**: the external decider **SHOULD** be declared by the distribution in the `capabilities.requestable` configuration, and the grant/resume **SHOULD** be completed through the `capability` program or an equivalent host interface; the distribution **SHOULD** document the decider identity and trigger conditions so program developers can anticipate request behavior.
 
 ---
-
 
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
@@ -2016,7 +2017,6 @@ Otherwise, it is non-conforming.
 
 ---
 
-
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
 > Protocol revision: `draft v1`.
@@ -2088,6 +2088,16 @@ The pattern-matching search window for A3 and the model path `<lmsc_rollback>` *
 - The current turn's IDLE start (cross-turn rollback is always outside the rollback search scope regardless of `scope`);
 - The parent session's context (the `session.fork` fork point is an implicit boundary for the child session).
 
+**Input region creation rules (normative)** - The kernel **MUST** create an input region interval for the current turn only via the following paths, and **MUST** include such intervals in the rollback hard boundaries and input-region visibility rules above:
+
+1. The host injecting a user message into the current turn on the user's behalf (including the first message at turn start and additional user messages within the same turn);
+2. The C2 `resume` external-event payload entering the token sequence of the current turn (this is the C2 atomic restoration path, **not** treated as program-state A4 injection);
+3. "External input bridge" paths **explicitly declared** by the distribution in boot output or runtime info (such as IDE host, tool host, external sensors, upstream agent transcription); each such path **MUST** be distinguished in audit by `source="external_input:<bridge>"`.
+
+The following paths **MUST NOT** create input regions (they are not part of the input-region set): any envelope and body bytes written by a program through `envelope.emit`; all A4 `token_inject` cases (including `BeforeNextSample` / `AtEnvelopeClose`); pin output injected by `runtime admin persona-refresh` (which belongs to the persona pin region kind, distinct from input regions); inline replacement bytes from a successful `ref.resolve` expansion; auto execute scaffold injection (§10.1.2); the kernel's own boot output (which belongs to the boot region). Any injection path not in the allowed set above **MUST NOT** be registered as an input region by an implementation; if a distribution wants to include additional paths in the input region set, it **MUST** explicitly declare them in boot output or runtime info under item 3 ("external input bridge"); otherwise the distribution is considered to deviate from this specification.
+
+If multiple permitted input injections occur within the same turn, the kernel **MUST** create a region per segment and record them as an **ordered set of intervals** in occurrence order; each remains an independent rollback hard boundary, and they **MUST NOT** be merged into a single contiguous interval or crossed by later injections. Each input region's audit / runtime-query view **SHOULD** carry at least the fields `kind="input"`, `turn_id`, `range`, and `source` (a user message or `external_input:<bridge>`).
+
 **Out-of-bound handling** (distinguishing control flow from audit outcome) - If any byte of the matched interval `[i, i+len(P))` falls outside a boundary, the kernel **MUST**:
 - **Control flow**: behave as if there were no hit - KV remains unchanged; if triggered by the program path A3, the syscall returns `E_ROLLBACK_PATTERN_NOT_FOUND`; if triggered by the model path, no error is returned to any caller (audit only).
 - **Audit `outcome` field**: **MUST** write `pattern_out_of_bound` (not `pattern_not_found`), so downstream training / analysis can clearly distinguish it from `pattern_not_found`, where there is truly no match in the whole context (same wording as §5.2 A3 / §4.1.2a).
@@ -2098,12 +2108,12 @@ The pattern-matching search window for A3 and the model path `<lmsc_rollback>` *
 
 **Search window upper bound**: actual search window = structural boundary crop (the boundary items above) ∩ independent search upper bound `ROLLBACK_SEARCH_MAX_BYTES`. If `ROLLBACK_SEARCH_MAX_BYTES` is non-null, when the kernel searches backward from the rollback point, the search range **MUST NOT** exceed that many bytes (prefer the smaller of the structural boundary and this upper bound). If the nearest match exists but falls outside that independent lookback window, audit `outcome` **MUST** be `pattern_out_of_bound`, with `effective_bound="search_max_bytes"`; it **MUST NOT** be classified as a true miss `pattern_not_found`. This field is declared in Appendix E boot output as `limits.rollback_search_max_bytes`.
 
-**Model-path default scope inference**:
+**Model-path default scope inference** (**reference** to the §4.1.2a source of truth; this section **MUST NOT** conflict with it):
 
-- Current state is `IN_ENVELOPE`: `scope = Envelope`;
-- Current state is `GENERATING` (no open envelope): `scope = Turn`.
+- If, before the `<lmsc_rollback>` open, the envelope stack contains at least one **non-rollback** envelope frame: `scope = Envelope`;
+- Otherwise (the stack contains no non-rollback envelope): `scope = Turn`.
 
-The inferred result is written into the `search_scope` field in §14.2 rollback audit details; top-level `AuditRecord.scope` continues to represent audit visibility.
+The rollback envelope itself **MUST NOT** participate in this inference, even if it is still on top of the stack at the moment `</lmsc_rollback>` close is processed. The inferred result is written into the `search_scope` field in §14.2 rollback audit details; top-level `AuditRecord.scope` continues to represent audit visibility.
 
 **Scope requirements for non-model injection paths**: rollback initiated by a program (A3 / `token_rollback`) or another non-model path **MUST** pass `scope` explicitly in call arguments; the kernel **MUST NOT** infer a default scope for non-model paths. If the caller does not provide the `scope` argument, the kernel **MUST** reject the call and return `E_PROTOCOL_VIOLATION` or an equivalent binding-layer error, and **MUST NOT** implicitly substitute `scope=Envelope`.
 
@@ -2191,7 +2201,6 @@ Over limit **MUST** be rejected; if the subsystem has defined a dedicated error 
 > **Rollback temporary stack occupancy and envelope depth limit** - (1) When depth has already reached the limit, `<lmsc_rollback>` open **MUST** be blocked by logit mask (L0 / L1) or post-hoc abort (L2); (2) if truncation actually reduces the envelope stack, the depth quota is released accordingly.
 
 ---
-
 
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
@@ -2316,7 +2325,6 @@ Differences between raw export and model-visible projection **MUST** be explicit
 `runtime audit tail` / `search` return a **projection** - the kernel **MUST** return only `scope=model-visible` and redact host privacy.
 
 ---
-
 
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
@@ -2495,7 +2503,6 @@ Every error code **MUST** define whether it is retryable in the distribution err
 
 ---
 
-
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
 > Protocol revision: `draft v1`.
@@ -2545,6 +2552,11 @@ Implementations claiming "LMSC conforming" **MUST**:
 - **C-N3** - When `features.auto_execute_scaffold=true` (§10.1.2), the kernel-owned attribute header that immediately follows the kernel-injected `<lmsc_execute>` open **MUST** contain `id` and `from="model"`, and **MUST NOT** contain a `program` field; the dispatch target **MUST** still be parsed from the first word of the body after `</lmsc_execute>` close. Any implementation that pre-fills `program` into the scaffold attribute header and skips body-first-word routing on that basis is **non-conforming**.
 - **C-N4** - Scaffold injection **MUST** occur only at `GENERATING` with envelope stack depth = 0; in any other state (`IN_ENVELOPE`, `DISPATCHING`, `SUSPENDED`, `INIT`, or `IDLE` before it has been left) the scaffold **MUST NOT** be triggered. The scaffold injection path **MUST** emit a `kind=envelope_open` audit with `details.open_source="kernel:scaffold"` and `details.envelope_from="model"`; this path **MUST NOT** be charged against `INJECT_MAX_TOKENS`, and sharing the same counter with the program-side A4 `token_inject` is **non-conforming**.
 - **C-N5** - Under strict + `raw_text_outside_envelope="forbidden"`, a successful expansion of `<lmsc_ref>` at envelope stack depth 0 **MUST NOT** write ordinary inline bytes returned by the resolver directly into context outside an envelope. The kernel **MUST** materialize the content as a complete system envelope / equivalent envelope-safe structure per §9.3, or reject the expansion and emit `protocol_violation` (`invariant="I-STRICT-ENVELOPE-ONLY"`, `context="ref_expand_strict_top_level"`).
+- **C-N6** - For any non-rollback envelope, the open token and the kernel-owned attribute header that immediately follows **MUST** be written as an indivisible unit (the §4.2 attribute-header injection atomicity general rule): this covers all paths - model-spontaneous open + default attribute header, `envelope.emit`, boot output, persona-refresh, auto execute scaffold, and canonicalization of open-tag-form input. Any C1 / C3 / C4 control event arriving during the write **MUST** be queued and handled only after the attribute header completes. The kernel **MUST NOT** allow an observable intermediate state where "the open is written but the attribute header is incomplete". If the write is abandoned, cancellation **MUST** happen **before** the open token is written and the kernel **MUST NOT** emit a `kind=envelope_open` audit.
+- **C-N7** - When a rollback envelope reaches `ROLLBACK_PATTERN_MAX_BYTES` under L0 / L1, the kernel **MUST** prefer to force-emit `</lmsc_rollback>` (forced close); only when the forced close would simultaneously violate other invariants such as `I-ROLLBACK-NO-NEST` / `I-ROLLBACK-NO-ATTR` may it downgrade to `<|lmsc_abort|>` (§4.1.2a). On the forced-close path, the `kind=rollback` audit details **MUST** contain `forced_close=true` and `effective_bound="pattern_max_bytes"`, and the resulting rollback envelope body **MUST NOT** exceed the upper bound. On the abort-fallback path, both `kind=rollback` (with `forced_close=true`, `forced_close_outcome="abort_fallback"`) and `kind=protocol_violation` (`invariant=I-ROLLBACK-BOUND`) **MUST** be emitted. Implementations **MUST NOT** handle the upper bound by silent truncation or by arbitrarily switching between the two paths.
+- **C-N8** - When A4 `token_inject` injects into a **non-rollback** envelope body, the kernel **MUST** validate at the syscall entry that the injected token sequence satisfies `I-CTRL-INSIDE-ENV` (§4.4): only `<|lmsc_abort|>` / `<|lmsc_suspend|>` / a complete ref element / a nested `<lmsc_rollback>` open are permitted; open / close tokens of any other envelope **MUST NOT** be injected, even if the caller holds the `tokens.inject.special` cap. Violation **MUST** return `E_INJECT_BAD_TOKEN` (details `reason="ctrl_inside_env_violation"`) and emit `kind=protocol_violation` (`invariant=I-CTRL-INSIDE-ENV`).
+- **C-N9** - The dispatcher-frame base set (§5.4) **MUST** be computed by the following filters: (1) `program.register` complete and `on_load` succeeded; (2) caller manifest / capabilities allow it; (3) the program's own manifest visibility allows the call source; (4) the §12 required-program routes are unconditionally reachable and **MUST NOT** be removed; (5) the distribution's dispatch policy does not deny it. `program_whitelist` on the frame stack can only **tighten** the set, not **widen** the base set; when the model-visible view of `program.list` temporarily disagrees with the base set (e.g. during `on_load`), dispatch authorization is decided by the base set.
+- **C-N10** - Input regions for the current turn **MUST** be created only via the paths listed in §13.3 (host-injected user message, the C2 `resume` external-event payload, and "external input bridge" paths explicitly declared by the distribution); the audit `source` field **MUST** match `external_input:<bridge>` or otherwise indicate the user-message origin. Paths such as `envelope.emit`, A4 `token_inject`, persona-refresh pin, `ref.resolve` expansion, scaffold injection, and boot output **MUST NOT** be registered as input regions by an implementation. Multiple input injections in the same turn **MUST** be recorded as an ordered set of intervals and **MUST NOT** be merged into a single contiguous interval.
 
 ### 16.1.1 Minimum Conformance Test Matrix
 
@@ -2596,7 +2608,6 @@ Implementations claiming "LMSC conforming" **MUST**:
 - Producing unregistered `E_ROLLBACK_BOUNDARY`, instead of expressing out-of-bounds with `rollback(outcome=pattern_out_of_bound)` or the program path's `E_ROLLBACK_PATTERN_NOT_FOUND` + `details.outcome=pattern_out_of_bound`.
 
 ---
-
 
 > LMSC Kernel Specification draft v1
 > LMSC = Large Model Specialized Computer.
