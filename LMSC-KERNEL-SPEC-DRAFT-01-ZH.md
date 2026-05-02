@@ -1153,6 +1153,7 @@ L2 无 sampler hook、推理栈适配层也**可能**不支持真正的 pull-bas
 - **Buffered 模式超时语义**：`buffered` 模式下，open token **禁止**在 stream 完全耗尽并缓冲完成之前注入 context；若缓冲期间触发 `STREAM_WRITE_TIMEOUT`（单次 `next()` 超时），kernel **必须**丢弃已缓冲内容、emit audit `kind=abort`（details 含 `reason="stream_timeout"`）并返 `E_EMIT_STREAM_BACKPRESSURE_TIMEOUT`——**禁止**补注 close token（因为 open token 尚未注入，不存在悬挂 envelope 需要关闭）。实现**禁止**同时满足"先注入 open token后再超时补 close"，这在 buffered 模式下属于非法状态。
 - **Buffered 正常路径的 `envelope_id`**：`buffered` 模式若启用 `on_envelope_chunk`，kernel **必须**在第一次 chunk callback 前预分配最终 `envelope_id`，并在后续 `on_envelope_chunk`、最终 envelope 注入、`envelope_open` / `envelope_emit` audit 中复用同一 id；程序观察到的 id **不得**从 `pending` 改写为另一个最终 id。只有在 open token 注入前被拒绝的路径可使用 `pending`，见下条。
 - **Buffered observer reject 路径**：`buffered` 模式下，若 `on_envelope_chunk` 在 open token 注入前返回 `AbortEnvelope` 或 `Err`，kernel **必须**停止后续回调、取消 generator / async iterator、丢弃缓冲区、emit audit `kind=abort`（details 含 `reason="handler_reject_chunk"`, `envelope_id="pending"`）并返回 `E_EMIT_STREAM_ABORTED`；**禁止**补注 close token，且**禁止**把 pending envelope 计入最终 context。`on_abort` 可被调用，但其 `envelope_id` **必须**标记为 `pending`，程序**禁止**据此访问已打开 envelope。
+- **`envelope_id="pending"` 的强制错误语义**：`pending` 是一次性诊断占位符，**永远不**对应已注入 context 的真实 envelope，且**禁止**被 kernel 在后续路径上重映射为某个最终 envelope id。程序在 `on_abort` 之外或之内据此对 kernel 发起的任何**需要真实 open envelope** 的操作——包括但不限于以该 id 调用 `envelope.emit` 续写、`envelope.close`、`region.tag` / `region.edit` / `region.body` 类查询与写入、`audit.emit(envelope_id=...)`、`tokens.inject` 以该 envelope 为目标的 `AtEnvelopeClose` 等——kernel **必须**拒绝并返回 `E_ABORT_NOT_OPEN`，details 建议含 `reason="pending_not_open"`，并**应** emit audit `kind=protocol_violation`（invariant=`I-CTRL-INSIDE-ENV` 或等价键，按调用入口归类）；**禁止**仅记录日志而放行。`on_abort(envelope_id="pending")` 本身不构成违规，但 handler 在该回调内**禁止**用该 id 触达 envelope 状态查询 / 修改 syscall。
 - 降级**禁止**影响 `features.envelope_chunk_observation="self-output-edit"` 所声明的 `on_envelope_chunk` 回调语义：若 handler 已注册且实现选择 `buffered` 模式，实现**必须**在注入前以 `CHUNK_MAX_TOKENS` 粒度对 `kind ∈ {output, edit}` 的缓冲区做分片回调，`source_path="program_emit_buffered"`。若实现无法提供该语义，**必须**声明 `features.envelope_chunk_observation="none"`，并应将兼容字段 `features.edit_stream_chunked` 置为 `false`。
 
 L0 / L1 实现**必须**为 `native`；仅 L2 可声明 `buffered`。
@@ -1390,6 +1391,14 @@ ChunkDecision := Continue | DetachObserver | AbortEnvelope
 > **Handler Context 生命周期**· `Context` **仅**在当前 callback 帧内有效；handler **禁止**跨 callback 持有。`dispatch` / `on_envelope_chunk` / `on_event` / `resolve_ref` / `on_load` / `on_unload` / `on_abort` 各自收到的 `ctx` 在该 callback 返回后作废；程序对失效 `ctx` 的调用为未定义行为（合规 kernel **可** 报 `E_KERNEL_INTERNAL`）。
 
 > **Fork 与 handler 内部状态边界**· A5 `session.fork` 只快照 kernel-managed state（context、KV cache、kernel 元数据、cap、audit、dispatcher frame、suspend handle、blob refcount 等，见 §9.4）；kernel **不** 自动复制 native / 宿主 handler 的进程内全局变量、堆对象、连接池或其他外部可变状态。合规 handler 若保存与 session 有关的内部可变状态，**必须**按 `session_id` / fork branch 隔离，或把该状态持久化到 kernel 管理的 KV / blob / ref / region 中。发行版若提供 native backend 且不能保证此隔离，**必须**在 backend 文档中声明 A5 fork 仅覆盖 kernel-managed state，**禁止**让程序假设 native 内部状态随 fork 自动 CoW。
+
+> **`on_load` loading 状态与可见性（规范性）**· `program.register` 的语义顺序为：(1) manifest 校验通过后程序入表，(2) 命名空间（`program:<name>/` KV 前缀、ref kind 注册等）就绪，(3) kernel 调 `on_load(ctx)`。在 (1)–(3) 之间程序处于 **`status=loading`** 状态；本节定义此状态下的可见性与可达性约束：
+>
+> 1. **自身与 admin 可见**· `loading` 程序对**自身**（即正在执行的 `on_load` callback）以及持 `program.admin` 的查询方在 `program.list` / `program.lookup` / `program.info` 中**应**可见，并**必须**以 `status="loading"` 字段如实标注。
+> 2. **普通模型可见视图**· 默认从 `program.list` 模型可见视图中**隐藏** `loading` 程序，或以 `status="loading"` 且不可作为 dispatch 目标的标记呈现；发行版**禁止**以「不带状态」的方式把 loading 程序混入正常可调用集。
+> 3. **外部 dispatch 不可达**· 在 `on_load` 成功返回（`Result::Ok`）**之前**，外部任何 B2 dispatch、syscall 路由、scaffold 等路径**禁止**进入该程序的 `dispatch` / `on_envelope_chunk` / `on_event` / `resolve_ref` / `on_abort` handler；尝试 dispatch `loading` 程序**必须**返 `E_PROG_NOT_FOUND`（与未注册等价）或发行版声明的等价错误，audit details 建议含 `reason="loading"`。该程序**不**进入 §5.4 base set 直到 `on_load` 成功。
+> 4. **on_load 失败**· 若 `on_load` 返回 `Err` 或 panic，kernel **必须**回滚 (1) 与 (2) 的 metadata（程序从表中移除、命名空间释放），并按既有 audit 规则记录失败；副作用类（已写入 KV / blob / region 的内容）按各原语自身的事务性规则处理，本节**不**追加事务回滚要求。
+> 5. **on_load 期间自调用**· `on_load` 内程序对 `runtime info` / `program.list` 等查询时**应**能看到自己处于 `loading`；它**禁止**对自身发起 B2 dispatch 形成自递归（外部 dispatch 不可达性保证这一点）。
 
 ## 8.3 Action 封闭集（7 条）
 
@@ -2107,6 +2116,14 @@ A3 与模型路径 `<lmsc_rollback>` 的模式匹配搜索窗口**禁止**跨越
 
 **搜索窗上限**：实际搜索窗口 = 结构边界裁剪（上述各项边界）∩ 独立搜索上限 `ROLLBACK_SEARCH_MAX_BYTES`。若 `ROLLBACK_SEARCH_MAX_BYTES` 非 null，kernel 在从回退点向前搜索时，搜索范围**禁止**超过该字节数（优先取结构边界与该上限中的较小者）。若最近匹配存在但落在该独立 lookback 窗外，audit `outcome` **必须**写 `pattern_out_of_bound`，`effective_bound="search_max_bytes"`；**禁止**把它归为真正未命中的 `pattern_not_found`。该字段在附录 E boot output `limits.rollback_search_max_bytes` 中声明。
 
+**`ROLLBACK_SEARCH_MAX_BYTES=null` 的约束**：当发行版选择不设置独立 lookback 字节上限时，kernel **必须**满足以下三条以补偿独立资源上界的缺失：
+
+1. **结构边界仍然生效**· null 仅取消独立 lookback 上限，不放松上述结构边界（已关闭 envelope、open token、boot / pin / input region、`rollback_safe=false` 屏障、turn IDLE 起点、父 session 边界）。
+2. **算法复杂度承诺**· rollback 模式匹配的实际搜索**必须**为相对窗口字节数线性时间，即 `O(window_bytes + len(pattern))`（典型实现：从尾部向前一次遍历 + KMP / Aho-Corasick 等线性匹配，或字节级 reverse-suffix 搜索）。**禁止**采用最坏情形 `O(window_bytes · len(pattern))` 或更高复杂度的实现。
+3. **运行时可观测**· 当 `ROLLBACK_SEARCH_MAX_BYTES=null` 时，每次 rollback 计算的 audit details **应**额外暴露 `effective_search_window_bytes`（本次匹配实际遍历的字节数上界）字段；`runtime info.stats`（若提供）**应**暴露 `rollback_search_max_bytes_effective`（自启动以来观察到的最大窗口字节数）。这两项**应**字段而非**必须**字段，目的是允许观测者监控发行版是否在长 turn / 大 context 场景下出现搜索窗失控。
+
+发行版**可**选择设置 `ROLLBACK_SEARCH_MAX_BYTES` 为有限值（推荐至少覆盖 256 KiB 量级），亦**可**保持 `null`；选择 null 时上述三条**必须**全部满足。两种设置均**禁止**以静默 best-effort 截断方式处理大窗口（即遇到大窗口直接放弃搜索而 emit `pattern_not_found`）。
+
 **模型路径默认 scope 推定**（**引用** §4.1.2a 正源；本节**禁止**与之冲突）：
 
 - 若 `<lmsc_rollback>` open **之前**栈上至少有一个**非 rollback** envelope 帧：`scope = Envelope`；
@@ -2556,6 +2573,9 @@ E_FORK_MEM_EXCEEDED
 - **C-N8** · A4 `token_inject` 进入**非 rollback** envelope body 时，kernel **必须**在 syscall 入口校验注入 token 序列满足 `I-CTRL-INSIDE-ENV`（§4.4）：仅许可 `<|lmsc_abort|>` / `<|lmsc_suspend|>` / 完整 ref element / 嵌套 `<lmsc_rollback>` open；任何其他 envelope 的 open / close token**禁止**注入，即使持 `tokens.inject.special` cap。违反者**必须**返 `E_INJECT_BAD_TOKEN`（details `reason="ctrl_inside_env_violation"`）并 emit `kind=protocol_violation`（`invariant=I-CTRL-INSIDE-ENV`）。
 - **C-N9** · `dispatcher frame` 的 base set（§5.4）**必须**按下列条件计算：(1) `program.register` 完成且 `on_load` 成功；(2) 调用方 manifest / capability 允许；(3) 程序自身 manifest 可见性允许调用源；(4) §12 必要程序固定可达，**禁止**被剔除；(5) 发行版 dispatch 策略未拒绝。frame stack 上 `program_whitelist` **只能**收紧，**禁止**扩大 base set；`program.list` 模型可见视图与 base set 暂时不一致时（如 `on_load` 期间），dispatch 授权以 base set 为准。
 - **C-N10** · 当前 turn 的 input region **必须**仅由 §13.3 所列允许路径创建（宿主用户消息注入、C2 `resume` 外部事件 payload、发行版显式声明的「外部输入桥接」），audit `source` 字段**必须**符合 `external_input:<bridge>` 形式或表明用户消息来源。`envelope.emit` / A4 `token_inject` / persona-refresh pin / `ref.resolve` 展开 / scaffold 注入 / boot output 等路径**禁止**被实现登记为 input region。同 turn 多次输入**必须**作为有序区间集合记录，**禁止**合并为单一连续区间。
+- **C-N11** · 程序 `register` 后至 `on_load` 成功返回前，程序处于 `status=loading`（§8.2）。kernel **必须**对外部 B2 dispatch / syscall 路由 / scaffold 等任何路径返 `E_PROG_NOT_FOUND`（建议 `details.reason="loading"`）；`program.list` 模型可见视图**必须**默认隐藏 loading 程序或带 `status="loading"` 标记，仅 `program.admin` 与程序自身可在 `on_load` 期间观察到自己；`on_load` 失败时 kernel **必须**回滚程序入表与命名空间 metadata，并按既有 audit 规则记录。
+- **C-N12** · 任何在 `on_envelope_chunk` reject 路径或 `on_abort` 中以 `envelope_id="pending"` 触达 envelope-state syscall（envelope.emit 续写、envelope.close、region.* 查询/写入、audit.emit、tokens.inject AtEnvelopeClose 等）的程序调用，kernel **必须**返 `E_ABORT_NOT_OPEN`（建议 `details.reason="pending_not_open"`）并 emit `kind=protocol_violation`（§6.5.2）。`pending` id **禁止**被 kernel 重映射为最终 envelope id。
+- **C-N13** · 当 `ROLLBACK_SEARCH_MAX_BYTES` 设为非 null 时，超出独立 lookback 窗的最近匹配**必须** audit `outcome=pattern_out_of_bound`、`effective_bound="search_max_bytes"`，**禁止**降级为 `pattern_not_found`。当设为 null 时 (a) 结构边界仍生效；(b) 模式匹配实现**必须**为 `O(window_bytes + len(pattern))` 线性时间，**禁止**最坏二次或更高复杂度；(c) audit details **应**额外暴露 `effective_search_window_bytes`，且 `runtime info.stats`（若提供）**应**暴露 `rollback_search_max_bytes_effective`（§13.3）。任一设置下**禁止**静默 best-effort 截断后归为 `pattern_not_found`。
 
 ### 16.1.1 最小合规测试矩阵
 
